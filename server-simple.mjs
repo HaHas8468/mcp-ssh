@@ -233,29 +233,65 @@ class SSHClient {
     return await this.configParser.getAllKnownHosts();
   }
 
-  async runRemoteCommand(hostAlias, command) {
-    try {
-      // Use execFile for security - prevents command injection
-      debugLog(`Executing: ssh ${hostAlias} ${command}\n`);
-      
-      const { stdout, stderr } = await execFileAsync('ssh', [hostAlias, command], {
-        timeout: 30000, // 30 second timeout
-        maxBuffer: 1024 * 1024 * 10 // 10MB buffer
+  async runRemoteCommand(hostAlias, command, options = {}) {
+    const timeout = options.timeout || 30000;
+    const MAX_OUTPUT_SIZE = 10 * 1024 * 1024; // 10MB limit
+
+    debugLog(`Executing: ssh ${hostAlias} ${command}\n`);
+
+    return new Promise((resolve) => {
+      const child = spawn('ssh', [hostAlias, command], {
+        stdio: ['ignore', 'pipe', 'pipe']
       });
-      
-      return {
-        stdout: stdout || '',
-        stderr: stderr || '',
-        code: 0
-      };
-    } catch (error) {
-      debugLog(`Error executing command on ${hostAlias}: ${error.message}\n`);
-      return {
-        stdout: error.stdout || '',
-        stderr: error.stderr || error.message,
-        code: error.code || 1
-      };
-    }
+
+      let stdout = '';
+      let stderr = '';
+      let killed = false;
+      let stdoutTruncated = false;
+      let stderrTruncated = false;
+
+      const timer = setTimeout(() => {
+        killed = true;
+        child.kill('SIGTERM');
+      }, timeout);
+
+      child.stdout.on('data', (data) => {
+        if (stdout.length < MAX_OUTPUT_SIZE) {
+          stdout += data.toString();
+        } else if (!stdoutTruncated) {
+          stdoutTruncated = true;
+          stdout += '\n[Output truncated - exceeded 10MB limit]';
+        }
+      });
+
+      child.stderr.on('data', (data) => {
+        if (stderr.length < MAX_OUTPUT_SIZE) {
+          stderr += data.toString();
+        } else if (!stderrTruncated) {
+          stderrTruncated = true;
+          stderr += '\n[Stderr truncated - exceeded 10MB limit]';
+        }
+      });
+
+      child.on('close', (code) => {
+        clearTimeout(timer);
+        resolve({
+          stdout,
+          stderr: killed ? stderr + '\n[Command timed out]' : stderr,
+          code: killed ? 124 : (code || 0)
+        });
+      });
+
+      child.on('error', (error) => {
+        clearTimeout(timer);
+        debugLog(`Error executing command on ${hostAlias}: ${error.message}\n`);
+        resolve({
+          stdout,
+          stderr: error.message,
+          code: 1
+        });
+      });
+    });
   }
 
   async getHostInfo(hostAlias) {
@@ -374,7 +410,7 @@ async function main() {
           },
           {
             name: "runRemoteCommand",
-            description: "Executes a shell command on an SSH host",
+            description: "Executes a shell command on an SSH host. For long-running commands, increase the timeout parameter.",
             inputSchema: {
               type: "object",
               properties: {
@@ -385,6 +421,10 @@ async function main() {
                 command: {
                   type: "string",
                   description: "The shell command to execute",
+                },
+                timeout: {
+                  type: "number",
+                  description: "Command timeout in milliseconds (default: 120000, max: 300000)",
                 },
               },
               required: ["hostAlias", "command"],
@@ -504,9 +544,11 @@ async function main() {
           }
 
           case "runRemoteCommand": {
+            const timeout = Math.min(args.timeout || 120000, 300000); // Default 2 min, cap at 5 min
             const result = await sshClient.runRemoteCommand(
               args.hostAlias,
-              args.command
+              args.command,
+              { timeout }
             );
             return {
               content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
