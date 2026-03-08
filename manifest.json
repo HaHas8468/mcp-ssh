@@ -25,10 +25,10 @@
   ],
   "server": {
     "type": "node",
-    "entry_point": "server-simple.mjs",
+    "entry_point": "server.mjs",
     "mcp_config": {
       "command": "node",
-      "args": ["${__dirname}/server-simple.mjs"],
+      "args": ["${__dirname}/server.mjs"],
       "env": {
         "MCP_SILENT": "true"
       }

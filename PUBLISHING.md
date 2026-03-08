@@ -71,4 +71,4 @@ The package is configured with:
 - Scoped name: `@aiondadotcom/mcp-ssh`
 - Public access
 - Binary: `mcp-ssh` command
-- Entry point: `server-simple.mjs`
+- Entry point: `server.mjs`

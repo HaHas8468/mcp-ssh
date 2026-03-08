@@ -2,17 +2,18 @@
   "name": "@aiondadotcom/mcp-ssh",
   "version": "1.2.0",
   "description": "MCP Agent for managing SSH hosts - A Model Context Protocol server for SSH operations",
-  "main": "server-simple.mjs",
+  "main": "server.mjs",
   "bin": {
     "mcp-ssh": "bin/mcp-ssh.js"
   },
   "type": "module",
   "scripts": {
-    "start": "node server-simple.mjs",
-    "dev": "node server-simple.mjs",
+    "start": "node server.mjs",
+    "dev": "node server.mjs",
     "build": "echo \"Build skipped\"",
     "build:dxt": "./scripts/build-dxt.sh",
-    "test": "echo \"No tests specified\" && exit 0",
+    "test": "vitest run --coverage",
+    "test:watch": "vitest",
     "prepublishOnly": "npm run test",
     "version": "git add -A",
     "postversion": "git push && git push --tags"
@@ -49,9 +50,11 @@
     "@anthropic-ai/dxt": "^0.2.5",
     "@types/node": "^20.11.26",
     "@types/ssh2": "^1.15.0",
+    "@vitest/coverage-v8": "^4.0.18",
     "tmp": ">=0.2.4",
     "ts-node": "^10.9.2",
-    "typescript": "^5.4.3"
+    "typescript": "^5.4.3",
+    "vitest": "^4.0.18"
   },
   "overrides": {
     "tmp": ">=0.2.4"

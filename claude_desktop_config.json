@@ -1,7 +1,0 @@
-{
-  "mcpServers": {
-    "mcp-ssh": {
-      "command": "/absolute/path/to/mcp-ssh/start.sh"
-    }
-  }
-}

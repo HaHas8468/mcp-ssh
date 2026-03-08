@@ -1,0 +1,6 @@
+services:
+  ssh-test:
+    build: .
+    ports:
+      - "2222:22"
+    container_name: mcp-ssh-test

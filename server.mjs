@@ -9,7 +9,7 @@
 
 // Import required Node.js modules
 import { homedir } from 'os';
-import { readFile } from 'fs/promises';
+import { readFile, stat, writeFile, chmod, unlink } from 'fs/promises';
 import { join } from 'path';
 import { fileURLToPath } from 'url';
 import { createRequire } from 'module';
@@ -70,12 +70,8 @@ class SSHConfigParser {
           const includePaths = this.expandIncludePath(section.value, configPath);
           
           for (const includePath of includePaths) {
-            try {
-              const includeHosts = await this.processIncludeDirectives(includePath);
-              hosts.push(...includeHosts);
-            } catch (error) {
-              debugLog(`Error processing include file ${includePath}: ${error.message}\n`);
-            }
+            const includeHosts = await this.processIncludeDirectives(includePath);
+            hosts.push(...includeHosts);
           }
         }
       }
@@ -120,15 +116,32 @@ class SSHConfigParser {
     }
   }
 
+  async checkFilePermissions(filePath) {
+    try {
+      const fileStat = await stat(filePath);
+      const mode = fileStat.mode & 0o777;
+      if (mode !== 0o600) {
+        throw new Error(
+          `SSH config file ${filePath} contains @password annotations but has insecure permissions (${mode.toString(8)}). ` +
+          `Required: 600. Fix with: chmod 600 ${filePath}`
+        );
+      }
+    } catch (error) {
+      if (error.code === 'ENOENT') return;
+      throw error;
+    }
+  }
+
   extractHostsFromConfig(config, configPath) {
     const hosts = [];
+    let hasPasswords = false;
 
     for (const section of config) {
       // Skip Include directives as they are processed separately
       if (section.param === 'Include') {
         continue;
       }
-      
+
       if (section.param === 'Host' && section.value !== '*') {
         const hostInfo = {
           hostname: '',
@@ -138,11 +151,21 @@ class SSHConfigParser {
 
         // Search all entries for this host
         for (const param of section.config) {
+          // Parse @password annotation from comments
+          if (param.type === 2 && param.content) {
+            const match = param.content.match(/^#\s*@password:\s*(.+)$/);
+            if (match) {
+              hostInfo._password = match[1];
+              hasPasswords = true;
+              continue;
+            }
+          }
+
           // Safety check for undefined param
           if (!param || !param.param) {
             continue;
           }
-          
+
           switch (param.param.toLowerCase()) {
             case 'hostname':
               hostInfo.hostname = param.value;
@@ -167,6 +190,12 @@ class SSHConfigParser {
           hosts.push(hostInfo);
         }
       }
+    }
+
+    // Store whether this config has passwords (for permission check)
+    if (hasPasswords) {
+      this._configsWithPasswords = this._configsWithPasswords || new Set();
+      this._configsWithPasswords.add(configPath);
     }
 
     return hosts;
@@ -194,7 +223,14 @@ class SSHConfigParser {
   async getAllKnownHosts() {
     // First: Get all hosts from ~/.ssh/config including Include directives (these are prioritized)
     const configHosts = await this.processIncludeDirectives(this.configPath);
-    
+
+    // Check file permissions for configs that contain @password annotations
+    if (this._configsWithPasswords) {
+      for (const configPath of this._configsWithPasswords) {
+        await this.checkFilePermissions(configPath);
+      }
+    }
+
     // Second: Get hostnames from ~/.ssh/known_hosts
     const knownHostnames = await this.parseKnownHosts();
 
@@ -227,10 +263,60 @@ class SSHConfigParser {
 class SSHClient {
   constructor() {
     this.configParser = new SSHConfigParser();
+    this._askpassScript = null;
+    this._spawn = spawn;
+    this._execFileAsync = execFileAsync;
   }
 
   async listKnownHosts() {
     return await this.configParser.getAllKnownHosts();
+  }
+
+  async getPasswordForHost(hostAlias) {
+    // Strip user@ prefix if present (e.g. "test@ssh-test" -> "ssh-test")
+    const cleanAlias = hostAlias.includes('@') ? hostAlias.split('@').pop() : hostAlias;
+    const hosts = await this.configParser.processIncludeDirectives(this.configParser.configPath);
+    const host = hosts.find(h => h.alias === cleanAlias || h.hostname === cleanAlias);
+    return host?._password || null;
+  }
+
+  async getAskpassScript() {
+    if (this._askpassScript) return this._askpassScript;
+
+    const { tmpdir } = require('os');
+    const scriptPath = join(tmpdir(), `mcp-ssh-askpass-${process.pid}.sh`);
+    await writeFile(scriptPath, '#!/bin/sh\necho "$MCP_SSH_PASS"\n');
+    await chmod(scriptPath, 0o700);
+    this._askpassScript = scriptPath;
+
+    // Clean up on exit
+    const cleanup = () => { try { require('fs').unlinkSync(scriptPath); } catch {} };
+    process.on('exit', cleanup);
+    process.on('SIGINT', () => { cleanup(); process.exit(130); });
+    process.on('SIGTERM', () => { cleanup(); process.exit(143); });
+
+    return scriptPath;
+  }
+
+  async buildSpawnEnv(hostAlias) {
+    const password = await this.getPasswordForHost(hostAlias);
+    if (!password) return null;
+
+    // Check file permissions before using password
+    if (this.configParser._configsWithPasswords) {
+      for (const configPath of this.configParser._configsWithPasswords) {
+        await this.configParser.checkFilePermissions(configPath);
+      }
+    }
+
+    const askpassScript = await this.getAskpassScript();
+    return {
+      ...process.env,
+      MCP_SSH_PASS: password,
+      SSH_ASKPASS: askpassScript,
+      SSH_ASKPASS_REQUIRE: 'force',
+      DISPLAY: ':0'
+    };
   }
 
   async runRemoteCommand(hostAlias, command, options = {}) {
@@ -239,10 +325,19 @@ class SSHClient {
 
     debugLog(`Executing: ssh ${hostAlias} ${command}\n`);
 
+    const passwordEnv = await this.buildSpawnEnv(hostAlias);
+
     return new Promise((resolve) => {
-      const child = spawn('ssh', [hostAlias, command], {
+      const spawnOptions = {
         stdio: ['ignore', 'pipe', 'pipe']
-      });
+      };
+      if (passwordEnv) {
+        spawnOptions.env = passwordEnv;
+        // setsid needed on some systems so SSH uses SSH_ASKPASS instead of tty
+        spawnOptions.detached = true;
+      }
+
+      const child = this._spawn('ssh', ['-o', 'StrictHostKeyChecking=accept-new', hostAlias, command], spawnOptions);
 
       let stdout = '';
       let stderr = '';
@@ -296,7 +391,14 @@ class SSHClient {
 
   async getHostInfo(hostAlias) {
     const hosts = await this.configParser.processIncludeDirectives(this.configParser.configPath);
-    return hosts.find(host => host.alias === hostAlias || host.hostname === hostAlias) || null;
+    const host = hosts.find(host => host.alias === hostAlias || host.hostname === hostAlias) || null;
+    if (host) {
+      // Never expose password to the LLM
+      const { _password, ...safeHost } = host;
+      if (_password) safeHost.passwordAuth = true;
+      return safeHost;
+    }
+    return null;
   }
 
   async checkConnectivity(hostAlias) {
@@ -321,10 +423,12 @@ class SSHClient {
   async uploadFile(hostAlias, localPath, remotePath) {
     try {
       debugLog(`Executing: scp ${localPath} ${hostAlias}:${remotePath}\n`);
-      
-      await execFileAsync('scp', [localPath, `${hostAlias}:${remotePath}`], { 
-        timeout: 60000 // 60 second timeout for file transfer
-      });
+
+      const passwordEnv = await this.buildSpawnEnv(hostAlias);
+      const options = { timeout: 60000 };
+      if (passwordEnv) options.env = passwordEnv;
+
+      await this._execFileAsync('scp', ['-o', 'StrictHostKeyChecking=accept-new', localPath, `${hostAlias}:${remotePath}`], options);
       return true;
     } catch (error) {
       debugLog(`Error uploading file to ${hostAlias}: ${error.message}\n`);
@@ -335,10 +439,12 @@ class SSHClient {
   async downloadFile(hostAlias, remotePath, localPath) {
     try {
       debugLog(`Executing: scp ${hostAlias}:${remotePath} ${localPath}\n`);
-      
-      await execFileAsync('scp', [`${hostAlias}:${remotePath}`, localPath], { 
-        timeout: 60000 // 60 second timeout for file transfer
-      });
+
+      const passwordEnv = await this.buildSpawnEnv(hostAlias);
+      const options = { timeout: 60000 };
+      if (passwordEnv) options.env = passwordEnv;
+
+      await this._execFileAsync('scp', ['-o', 'StrictHostKeyChecking=accept-new', `${hostAlias}:${remotePath}`, localPath], options);
       return true;
     } catch (error) {
       debugLog(`Error downloading file from ${hostAlias}: ${error.message}\n`);
@@ -538,8 +644,13 @@ async function main() {
         switch (name) {
           case "listKnownHosts": {
             const hosts = await sshClient.listKnownHosts();
+            // Strip passwords before sending to LLM
+            const safeHosts = hosts.map(({ _password, ...host }) => {
+              if (_password) host.passwordAuth = true;
+              return host;
+            });
             return {
-              content: [{ type: "text", text: JSON.stringify(hosts, null, 2) }],
+              content: [{ type: "text", text: JSON.stringify(safeHosts, null, 2) }],
             };
           }
 
@@ -630,8 +741,20 @@ async function main() {
   }
 }
 
-// Start the server
-main().catch(error => {
-  debugLog(`Unhandled error: ${error.message}\n`);
-  process.exit(1);
-});
+// Export classes for testing
+export { SSHConfigParser, SSHClient, debugLog, main };
+
+/* c8 ignore start */
+// Start the server only when run directly
+const isMainModule = process.argv[1] && (
+  process.argv[1] === fileURLToPath(import.meta.url) ||
+  process.argv[1].endsWith('/server.mjs')
+);
+
+if (isMainModule) {
+  main().catch(error => {
+    debugLog(`Unhandled error: ${error.message}\n`);
+    process.exit(1);
+  });
+}
+/* c8 ignore stop */

@@ -1,5 +1,7 @@
 # MCP SSH Agent
 
+[![Tests](https://github.com/AiondaDotCom/mcp-ssh/actions/workflows/test.yml/badge.svg)](https://github.com/AiondaDotCom/mcp-ssh/actions/workflows/test.yml)
+
 A Model Context Protocol (MCP) server for managing and controlling SSH connections. This server integrates seamlessly with Claude Desktop and other MCP-compatible clients to provide AI-powered SSH operations.
 
 ## Overview
@@ -74,6 +76,7 @@ This screenshot demonstrates the MCP SSH Agent integrated with Claude, showing h
 - **Reliable SSH**: Uses native `ssh`/`scp` commands instead of JavaScript SSH libraries
 - **Automatic Discovery**: Finds hosts from SSH config and known_hosts files
 - **Full SSH Support**: Works with SSH agents, keys, and all authentication methods
+- **Password Authentication**: Supports password-based SSH login and key passphrases via `@password` annotation — passwords never leave your machine
 - **File Operations**: Upload and download files using `scp`
 - **Batch Commands**: Execute multiple commands in sequence
 - **Error Handling**: Comprehensive error reporting with timeouts
@@ -170,6 +173,34 @@ The agent reads from standard SSH configuration files:
 - `~/.ssh/known_hosts` - Known host keys
 
 Make sure your SSH keys are properly configured and accessible via SSH agent or key files.
+
+#### Password Authentication
+
+For hosts that require password-based authentication (common with network infrastructure like switches and routers), you can store the password directly in your `~/.ssh/config` using a special comment annotation:
+
+```ssh-config
+Host myrouter
+    HostName 192.168.1.1
+    User admin
+    # @password:yourSecretPassword
+
+Host myserver
+    HostName 10.0.0.5
+    User deploy
+    IdentityFile ~/.ssh/id_rsa
+    # @password:myKeyPassphrase
+```
+
+**How it works:**
+- The `# @password:` annotation is read **locally** by the MCP server — the password **never** reaches the AI model or any cloud provider
+- Works for both login passwords and SSH key passphrases
+- The password is split at the first `:`, so passwords containing `:` are supported
+- When listing hosts, only `passwordAuth: true` is shown — the actual password is never exposed
+
+**Security requirements:**
+- Your SSH config file **must** have `600` permissions when using `@password` annotations
+- The MCP server will refuse to start if the file permissions are too open
+- Fix with: `chmod 600 ~/.ssh/config`
 
 #### Include Directive Support
 
@@ -562,7 +593,7 @@ MIT License - see LICENSE file for details.
 
 ```
 mcp-ssh/
-├── server-simple.mjs          # Main MCP server implementation
+├── server.mjs          # Main MCP server implementation
 ├── manifest.json              # DXT package manifest
 ├── package.json               # Dependencies and scripts
 ├── README.md                  # Documentation

@@ -18,12 +18,16 @@ start-silent.sh
 *.log
 node_modules/
 
+# Tests
+test-ssh/
+*.test.mjs
+
 # Generated files
 *.tgz
 
 # Keep these files for npm package
 !package.json
 !README.md
-!server-simple.mjs
+!server.mjs
 !LICENSE
 !CHANGELOG.md

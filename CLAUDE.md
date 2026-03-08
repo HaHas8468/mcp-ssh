@@ -17,7 +17,7 @@ This is MCP SSH Agent (@aiondadotcom/mcp-ssh) - a Model Context Protocol (MCP) s
 ### Development Scripts
 - `./start.sh` - Start the server with debug output
 - `./start-silent.sh` - Start the server in silent mode (no debug output)
-- `node server-simple.mjs` - Direct server execution
+- `node server.mjs` - Direct server execution
 
 ### Publishing
 - `npm version patch|minor|major` - Bump version and create git tag
@@ -31,14 +31,14 @@ This is MCP SSH Agent (@aiondadotcom/mcp-ssh) - a Model Context Protocol (MCP) s
 ## Architecture
 
 ### Main Entry Point
-- `server-simple.mjs` - Self-contained MCP server implementation that includes all functionality inline to avoid module resolution issues
+- `server.mjs` - Self-contained MCP server implementation that includes all functionality inline to avoid module resolution issues
 
 ### Other Files
 - `bin/mcp-ssh.js` - Binary wrapper for npx compatibility
 
 ### Key Design Decisions
 1. **Native SSH Tools**: Uses system `ssh` and `scp` commands rather than JavaScript SSH libraries for reliability
-2. **Self-contained**: `server-simple.mjs` includes all code inline to avoid ESM import issues
+2. **Self-contained**: `server.mjs` includes all code inline to avoid ESM import issues
 3. **Silent Mode**: Controlled by `MCP_SILENT` environment variable to disable debug output when used as MCP server
 
 ## SSH Configuration Integration
@@ -48,6 +48,24 @@ The agent automatically discovers SSH hosts from:
 - `~/.ssh/known_hosts` - Additional hosts not in config
 
 Host discovery prioritizes SSH config entries first, then adds additional hosts from known_hosts.
+
+### Password Authentication
+
+Passwords can be stored as comment annotations in `~/.ssh/config`:
+```
+Host myrouter
+    HostName 192.168.1.1
+    User admin
+    # @password:secretPassword
+```
+
+- The `# @password:` annotation is read locally — the password **never** reaches the LLM or cloud provider
+- Works for login passwords and SSH key passphrases
+- Passwords are stripped from all tool outputs (only `passwordAuth: true` is exposed)
+- The server enforces `chmod 600` on config files containing `@password` annotations
+- Uses `SSH_ASKPASS` mechanism internally (temp script + env variable, no external dependencies)
+- The `user@host` format is supported for password lookup (strips user prefix to find the config entry)
+- Unknown host fingerprints are auto-accepted via `StrictHostKeyChecking=accept-new` (changed keys are still rejected)
 
 ## MCP Tools Provided
 
@@ -106,7 +124,7 @@ The project supports Desktop Extensions (.dxt) for easy installation in Claude D
 ## Important Notes
 
 - The project is ESM-only (`"type": "module"` in package.json)
-- Production code is in `server-simple.mjs`, not compiled from TypeScript
-- SSH operations require properly configured SSH keys and host access
+- Production code is in `server.mjs`, not compiled from TypeScript
+- SSH operations require properly configured SSH keys or `@password` annotations
 - The agent runs over STDIO as an MCP server, not as a standalone application
 - DXT packages provide one-click installation alternative to manual JSON configuration
