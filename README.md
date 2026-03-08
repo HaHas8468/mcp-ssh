@@ -127,7 +127,7 @@ If you prefer to run the server manually or integrate it with other MCP clients:
 
 ## Requirements
 
-- Node.js 18 or higher
+- Node.js 20 or higher
 - SSH client installed (`ssh` and `scp` commands available)
 - SSH configuration files (`~/.ssh/config` and `~/.ssh/known_hosts`)
 
@@ -552,7 +552,7 @@ For developers who want to build DXT packages locally:
 
 ### Prerequisites
 
-- Node.js 18 or higher
+- Node.js 20 or higher
 - npm
 
 ### Building DXT Package
