@@ -25,6 +25,8 @@ const sshConfig = require('ssh-config');
 const execAsync = promisify(exec);
 const execFileAsync = promisify(execFile);
 
+const isWindows = process.platform === 'win32';
+
 // Silent mode for MCP clients - disable debug output when used as MCP server
 const SILENT_MODE = process.env.MCP_SILENT === 'true' || process.argv.includes('--silent');
 
@@ -117,6 +119,8 @@ class SSHConfigParser {
   }
 
   async checkFilePermissions(filePath) {
+    // Windows doesn't support Unix file permissions - skip check
+    if (isWindows) return;
     try {
       const fileStat = await stat(filePath);
       const mode = fileStat.mode & 0o777;
@@ -284,9 +288,15 @@ class SSHClient {
     if (this._askpassScript) return this._askpassScript;
 
     const { tmpdir } = require('os');
-    const scriptPath = join(tmpdir(), `mcp-ssh-askpass-${process.pid}.sh`);
-    await writeFile(scriptPath, '#!/bin/sh\necho "$MCP_SSH_PASS"\n');
-    await chmod(scriptPath, 0o700);
+    let scriptPath;
+    if (isWindows) {
+      scriptPath = join(tmpdir(), `mcp-ssh-askpass-${process.pid}.cmd`);
+      await writeFile(scriptPath, '@echo off\r\necho %MCP_SSH_PASS%\r\n');
+    } else {
+      scriptPath = join(tmpdir(), `mcp-ssh-askpass-${process.pid}.sh`);
+      await writeFile(scriptPath, '#!/bin/sh\necho "$MCP_SSH_PASS"\n');
+      await chmod(scriptPath, 0o700);
+    }
     this._askpassScript = scriptPath;
 
     // Clean up on exit
@@ -329,12 +339,19 @@ class SSHClient {
 
     return new Promise((resolve) => {
       const spawnOptions = {
-        stdio: ['ignore', 'pipe', 'pipe']
+        stdio: ['ignore', 'pipe', 'pipe'],
+        windowsHide: true
       };
+      if (isWindows) {
+        // On Windows, shell: true ensures ssh is found via PATH and env vars are resolved
+        spawnOptions.shell = true;
+      }
       if (passwordEnv) {
         spawnOptions.env = passwordEnv;
-        // setsid needed on some systems so SSH uses SSH_ASKPASS instead of tty
-        spawnOptions.detached = true;
+        if (!isWindows) {
+          // setsid needed on some systems so SSH uses SSH_ASKPASS instead of tty
+          spawnOptions.detached = true;
+        }
       }
 
       const child = this._spawn('ssh', ['-o', 'StrictHostKeyChecking=accept-new', hostAlias, command], spawnOptions);
@@ -425,7 +442,8 @@ class SSHClient {
       debugLog(`Executing: scp ${localPath} ${hostAlias}:${remotePath}\n`);
 
       const passwordEnv = await this.buildSpawnEnv(hostAlias);
-      const options = { timeout: 60000 };
+      const options = { timeout: 60000, windowsHide: true };
+      if (isWindows) options.shell = true;
       if (passwordEnv) options.env = passwordEnv;
 
       await this._execFileAsync('scp', ['-o', 'StrictHostKeyChecking=accept-new', localPath, `${hostAlias}:${remotePath}`], options);
@@ -441,7 +459,8 @@ class SSHClient {
       debugLog(`Executing: scp ${hostAlias}:${remotePath} ${localPath}\n`);
 
       const passwordEnv = await this.buildSpawnEnv(hostAlias);
-      const options = { timeout: 60000 };
+      const options = { timeout: 60000, windowsHide: true };
+      if (isWindows) options.shell = true;
       if (passwordEnv) options.env = passwordEnv;
 
       await this._execFileAsync('scp', ['-o', 'StrictHostKeyChecking=accept-new', `${hostAlias}:${remotePath}`, localPath], options);
