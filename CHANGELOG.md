@@ -5,6 +5,16 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.3.7] - 2026-04-11
+
+### Security
+- Resolved all open `npm audit` advisories (4 high, 3 moderate) by bumping transitive dependencies. Seven GHSAs no longer reachable from this package:
+  - `path-to-regexp` (prod, via `@modelcontextprotocol/sdk → express → router`) — CVE-2024-45296 / CVE-2024-52798 DoS (not exploitable via our STDIO-only usage, fixed anyway).
+  - `node-forge` — GHSA-2328-f5f3-gj25, GHSA-q67f-28xg-22rw, GHSA-5m6q-g25r-mvwx, GHSA-ppp5-5v6c-4jwp.
+  - `hono`, `@hono/node-server`, `brace-expansion` (dev, via vitest chain).
+  - `picomatch`, `vite` (dev, via vitest chain) — required a `vitest`/`@vitest/coverage-v8` minor bump from 4.0.18 to 4.1.4.
+- `npm audit --audit-level=high` now reports zero vulnerabilities. CI workflow's security audit step is unchanged and continues to block on any future high-severity finding.
+
 ## [1.3.6] - 2026-04-11
 
 ### Fixed
