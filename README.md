@@ -531,6 +531,23 @@ Host staging
     IdentitiesOnly yes
 ```
 
+## Threat Model and Trust Boundaries
+
+MCP SSH Agent gives an LLM the ability to drive `ssh` and `scp` on your behalf. Before using it, it is important to understand what an attacker who controls the LLM's instructions (for example via **prompt injection** through web pages, e‑mails, repository files, or another MCP server's output) can do:
+
+- **`runRemoteCommand` is full remote code execution on every host you have configured.** If your `~/.ssh/config` contains an entry for `production`, the LLM can run arbitrary commands as that user on that host. This is the tool's purpose, not a bug — but it means you should only configure hosts that you are willing to let the LLM touch, and prefer least-privilege accounts.
+- **`uploadFile` and `downloadFile` give the LLM access to the local filesystem** with the privileges of the user running the MCP server. The LLM can read any file the process can read (including `~/.ssh/id_*`, browser data, source trees, `.env` files) and write to any path it can write to (including `~/.ssh/authorized_keys`). The path arguments are not sandboxed because the tool's contract is "transfer arbitrary files".
+- **The MCP server runs locally over STDIO, but the LLM is not trusted.** STDIO only describes the transport — the *content* of tool arguments is chosen by the model, which can be steered by any untrusted text it ingests during the conversation.
+- **`# @password:` annotations are kept out of the LLM's context**, but they live in `~/.ssh/config` on disk. Anything that gives an attacker arbitrary local file read (see above) also exposes those passwords. The annotation only protects against the LLM seeing the password through the MCP protocol, not against local file disclosure.
+
+### Recommendations
+
+- Run MCP SSH Agent under a **dedicated, unprivileged OS user** whose home directory only contains the SSH config and keys you actually want the LLM to be able to use.
+- Or run it inside a **container / sandbox** with a minimal `~/.ssh` and no access to other secrets on your machine.
+- Keep `~/.ssh/config` to the smallest set of hosts you trust the LLM with. Use restricted shell users on the remote side where possible.
+- Treat any session where the LLM ingests untrusted content (web pages, e‑mails, third‑party repos, other MCP servers' output) as potentially hostile to MCP SSH operations.
+- Report suspected vulnerabilities via GitHub's private vulnerability reporting on this repository.
+
 ## Security Best Practices
 
 ### SSH Key Security

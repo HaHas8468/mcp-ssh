@@ -20,12 +20,38 @@ const require = createRequire(import.meta.url);
 // Required libraries
 const { spawn, exec, execFile } = require('child_process');
 const { promisify } = require('util');
+const { statSync } = require('fs');
 const sshConfig = require('ssh-config');
 
 const execAsync = promisify(exec);
 const execFileAsync = promisify(execFile);
 
 const isWindows = process.platform === 'win32';
+
+// Resolve an executable's absolute path on Windows by walking PATH and PATHEXT.
+// This lets us call spawn() with shell:false on Windows — without it we would
+// need shell:true to find ssh.exe/scp.exe via PATH, which would route every
+// argument through cmd.exe and make characters like &, |, ^, >, " usable for
+// local command injection. Returns the bare name on non-Windows (POSIX spawn
+// already searches PATH safely).
+function resolveExecutable(name) {
+  if (!isWindows) return name;
+  const pathDirs = (process.env.PATH || process.env.Path || '').split(';');
+  const exts = (process.env.PATHEXT || '.EXE;.CMD;.BAT;.COM').split(';');
+  for (const dir of pathDirs) {
+    if (!dir) continue;
+    for (const ext of exts) {
+      const candidate = join(dir, name + ext);
+      try {
+        if (statSync(candidate).isFile()) return candidate;
+      } catch {}
+    }
+  }
+  return name + '.exe';
+}
+
+const SSH_BIN = resolveExecutable('ssh');
+const SCP_BIN = resolveExecutable('scp');
 
 // Silent mode for MCP clients - disable debug output when used as MCP server
 const SILENT_MODE = process.env.MCP_SILENT === 'true' || process.argv.includes('--silent');
@@ -90,17 +116,17 @@ class SSHConfigParser {
   }
 
   expandIncludePath(includePath, baseConfigPath) {
-    const { dirname, resolve } = require('path');
+    const { dirname, resolve, isAbsolute, win32 } = require('path');
     const { glob } = require('glob');
     const { existsSync } = require('fs');
     
     // Handle tilde expansion
-    if (includePath.startsWith('~/')) {
-      includePath = includePath.replace('~', homedir());
+    if (/^~(?=[\\/])/.test(includePath)) {
+      includePath = includePath.replace(/^~/, homedir());
     }
     
     // Handle relative paths
-    if (!includePath.startsWith('/')) {
+    if (!isAbsolute(includePath) && !win32.isAbsolute(includePath)) {
       const baseDir = dirname(baseConfigPath);
       includePath = resolve(baseDir, includePath);
     }
@@ -276,6 +302,38 @@ class SSHClient {
     return await this.configParser.getAllKnownHosts();
   }
 
+  _assertSafeHostAlias(hostAlias) {
+    if (typeof hostAlias !== 'string' || hostAlias.length === 0) {
+      throw new Error('hostAlias must be a non-empty string');
+    }
+    // Strict whitelist. Two threats this defends against:
+    //   1. ssh/scp option injection via leading '-' (e.g. -oProxyCommand=…),
+    //      which would execute arbitrary commands LOCALLY on this machine.
+    //   2. cmd.exe metacharacter injection on Windows, where spawnOptions.shell
+    //      is true and characters like &, |, ^, >, " would otherwise be
+    //      interpreted by the shell before ssh.exe ever sees them.
+    // Allowed: alphanumerics, '.', '_', '-', ':', '@'. Must not start with '-'.
+    if (!/^[A-Za-z0-9_.@:][A-Za-z0-9._@:-]*$/.test(hostAlias)) {
+      throw new Error(
+        `Invalid hostAlias: must match [A-Za-z0-9._@:-] and not start with '-'`
+      );
+    }
+  }
+
+  async _assertKnownHostAlias(hostAlias) {
+    const cleanAlias = hostAlias.includes('@') ? hostAlias.split('@').pop() : hostAlias;
+    const knownHosts = await this.configParser.getAllKnownHosts();
+    const isKnown = knownHosts.some((host) =>
+      host.alias === hostAlias ||
+      host.hostname === hostAlias ||
+      host.alias === cleanAlias ||
+      host.hostname === cleanAlias
+    );
+    if (!isKnown) {
+      throw new Error(`Unknown hostAlias: ${hostAlias} is not defined in ~/.ssh/config or ~/.ssh/known_hosts`);
+    }
+  }
+
   async getPasswordForHost(hostAlias) {
     // Strip user@ prefix if present (e.g. "test@ssh-test" -> "ssh-test")
     const cleanAlias = hostAlias.includes('@') ? hostAlias.split('@').pop() : hostAlias;
@@ -324,12 +382,16 @@ class SSHClient {
       ...process.env,
       MCP_SSH_PASS: password,
       SSH_ASKPASS: askpassScript,
-      SSH_ASKPASS_REQUIRE: 'force',
-      DISPLAY: ':0'
+      // `force` tells OpenSSH to use the askpass helper even without a GUI/TTY.
+      // Avoid injecting a fake DISPLAY value here; that's a POSIX/X11 assumption
+      // and can break platform-specific behavior, especially on Windows.
+      SSH_ASKPASS_REQUIRE: 'force'
     };
   }
 
   async runRemoteCommand(hostAlias, command, options = {}) {
+    this._assertSafeHostAlias(hostAlias);
+    await this._assertKnownHostAlias(hostAlias);
     const timeout = options.timeout || 30000;
     const MAX_OUTPUT_SIZE = 10 * 1024 * 1024; // 10MB limit
 
@@ -340,12 +402,13 @@ class SSHClient {
     return new Promise((resolve) => {
       const spawnOptions = {
         stdio: ['ignore', 'pipe', 'pipe'],
-        windowsHide: true
+        windowsHide: true,
+        // shell:false is critical on Windows: with shell:true the args would
+        // be re-parsed by cmd.exe and metacharacters in `command` could lead
+        // to local command injection. We rely on resolveExecutable() to find
+        // ssh.exe on Windows so PATH lookup is not needed.
+        shell: false
       };
-      if (isWindows) {
-        // On Windows, shell: true ensures ssh is found via PATH and env vars are resolved
-        spawnOptions.shell = true;
-      }
       if (passwordEnv) {
         spawnOptions.env = passwordEnv;
         if (!isWindows) {
@@ -354,7 +417,7 @@ class SSHClient {
         }
       }
 
-      const child = this._spawn('ssh', ['-o', 'StrictHostKeyChecking=accept-new', hostAlias, command], spawnOptions);
+      const child = this._spawn(SSH_BIN, ['-o', 'StrictHostKeyChecking=accept-new', '--', hostAlias, command], spawnOptions);
 
       let stdout = '';
       let stderr = '';
@@ -439,14 +502,15 @@ class SSHClient {
 
   async uploadFile(hostAlias, localPath, remotePath) {
     try {
+      this._assertSafeHostAlias(hostAlias);
+      await this._assertKnownHostAlias(hostAlias);
       debugLog(`Executing: scp ${localPath} ${hostAlias}:${remotePath}\n`);
 
       const passwordEnv = await this.buildSpawnEnv(hostAlias);
-      const options = { timeout: 60000, windowsHide: true };
-      if (isWindows) options.shell = true;
+      const options = { timeout: 60000, windowsHide: true, shell: false };
       if (passwordEnv) options.env = passwordEnv;
 
-      await this._execFileAsync('scp', ['-o', 'StrictHostKeyChecking=accept-new', localPath, `${hostAlias}:${remotePath}`], options);
+      await this._execFileAsync(SCP_BIN, ['-o', 'StrictHostKeyChecking=accept-new', '--', localPath, `${hostAlias}:${remotePath}`], options);
       return true;
     } catch (error) {
       debugLog(`Error uploading file to ${hostAlias}: ${error.message}\n`);
@@ -456,14 +520,15 @@ class SSHClient {
 
   async downloadFile(hostAlias, remotePath, localPath) {
     try {
+      this._assertSafeHostAlias(hostAlias);
+      await this._assertKnownHostAlias(hostAlias);
       debugLog(`Executing: scp ${hostAlias}:${remotePath} ${localPath}\n`);
 
       const passwordEnv = await this.buildSpawnEnv(hostAlias);
-      const options = { timeout: 60000, windowsHide: true };
-      if (isWindows) options.shell = true;
+      const options = { timeout: 60000, windowsHide: true, shell: false };
       if (passwordEnv) options.env = passwordEnv;
 
-      await this._execFileAsync('scp', ['-o', 'StrictHostKeyChecking=accept-new', `${hostAlias}:${remotePath}`, localPath], options);
+      await this._execFileAsync(SCP_BIN, ['-o', 'StrictHostKeyChecking=accept-new', '--', `${hostAlias}:${remotePath}`, localPath], options);
       return true;
     } catch (error) {
       debugLog(`Error downloading file from ${hostAlias}: ${error.message}\n`);

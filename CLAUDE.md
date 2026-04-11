@@ -12,7 +12,8 @@ This is MCP SSH Agent (@aiondadotcom/mcp-ssh) - a Model Context Protocol (MCP) s
 - `npm start` - Start the MCP server (same as `npm run dev`)
 - `npm run dev` - Start the MCP server with debug output
 - `npm run build` - Currently a no-op (echo "Build skipped")
-- `npm test` - Currently a no-op (echo "No tests specified")
+- `npm test` - Run the vitest suite (`server.test.mjs`) with coverage
+- `npm run test:watch` - Vitest in watch mode
 
 ### Development Scripts
 - `./start.sh` - Start the server with debug output
@@ -40,6 +41,8 @@ This is MCP SSH Agent (@aiondadotcom/mcp-ssh) - a Model Context Protocol (MCP) s
 1. **Native SSH Tools**: Uses system `ssh` and `scp` commands rather than JavaScript SSH libraries for reliability
 2. **Self-contained**: `server.mjs` includes all code inline to avoid ESM import issues
 3. **Silent Mode**: Controlled by `MCP_SILENT` environment variable to disable debug output when used as MCP server
+4. **No shell on spawn**: All `spawn`/`execFile` calls use `shell: false`. On Windows, `ssh.exe`/`scp.exe` are resolved to absolute paths once at startup via `resolveExecutable()` (PATH + PATHEXT walk), so PATH lookup does not require `shell: true`. This is required to prevent local command injection through shell metacharacters in tool arguments.
+5. **Strict `hostAlias` whitelist**: `_assertSafeHostAlias()` (`SSHClient`) rejects any `hostAlias` that does not match `^[A-Za-z0-9_.@:][A-Za-z0-9._@:-]*$`. Combined with the `--` argument terminator on every `ssh`/`scp` invocation, this blocks SSH option injection (e.g. `-oProxyCommand=…`) and shell-metacharacter injection. Validation is applied at the public entry points (`runRemoteCommand`, `uploadFile`, `downloadFile`) and transitively covers `checkConnectivity` and `runCommandBatch`. **Do not weaken or bypass this validator** without understanding the security implications — see CHANGELOG entry for 1.3.5.
 
 ## SSH Configuration Integration
 
@@ -121,9 +124,19 @@ The project supports Desktop Extensions (.dxt) for easy installation in Claude D
 - `.dxt` files are ZIP archives containing the manifest and server files
 - Built packages are excluded from git via `.gitignore` but can be uploaded to GitHub releases
 
+## Threat Model
+
+The LLM driving this MCP server is **not trusted** — its tool arguments can be steered by prompt injection from any untrusted text in the conversation context (web pages, e-mails, repo files, output of other MCP servers). When changing this codebase, keep these invariants:
+
+- **Local RCE must stay impossible.** `hostAlias`, `command`, `localPath` and `remotePath` must never reach a shell on the local machine. Use `spawn`/`execFile` with `shell: false` and an argv array. Never re-introduce `shell: true`.
+- **`runRemoteCommand` is by-design RCE on the configured remote.** That is the tool's contract; do not try to "sanitize" the `command` argument.
+- **`uploadFile`/`downloadFile` give the LLM the local filesystem with the server process's privileges.** The README documents this; users are expected to run mcp-ssh under an unprivileged user or in a sandbox. Path arguments are not sandboxed.
+- **`# @password:` values must never appear in MCP responses** or in any string the LLM can see. Only `passwordAuth: true` is exposed.
+- See README → "Threat Model and Trust Boundaries" for the user-facing version of this.
+
 ## Important Notes
 
-- The project is ESM-only (`"type": "module"` in package.json)
+- The project is ESM-only (`"type": "module"` in package.json). The `.mjs` extension on `server.mjs` is historical and redundant given `"type": "module"`; keep it for now to avoid touching `bin/`, `manifest.json`, `package.json` `main`, and the start scripts.
 - Production code is in `server.mjs`, not compiled from TypeScript
 - SSH operations require properly configured SSH keys or `@password` annotations
 - The agent runs over STDIO as an MCP server, not as a standalone application

@@ -399,6 +399,21 @@ Host main
       expect(result).toEqual([]);
     });
 
+    it('should treat Windows drive-letter paths as absolute', () => {
+      const result = parser.expandIncludePath('C:\\nonexistent-absolute-path-xyz', '/base/config');
+      expect(result).toEqual([]);
+    });
+
+    it('should treat UNC paths as absolute', () => {
+      const result = parser.expandIncludePath('\\\\server\\share\\nonexistent-path-xyz', '/base/config');
+      expect(result).toEqual([]);
+    });
+
+    it('should expand tilde paths with backslashes', () => {
+      const result = parser.expandIncludePath('~\\nonexistent-path-xyz', '/base');
+      expect(result).toEqual([]);
+    });
+
     it('should return empty for non-existent glob patterns', () => {
       const result = parser.expandIncludePath('/nonexistent-path-xyz/*.conf', '/base');
       expect(result).toEqual([]);
@@ -504,7 +519,7 @@ describe('SSHClient', () => {
       expect(env.MCP_SSH_PASS).toBe('killer99');
       expect(env.SSH_ASKPASS).toContain('mcp-ssh-askpass');
       expect(env.SSH_ASKPASS_REQUIRE).toBe('force');
-      expect(env.DISPLAY).toBe(':0');
+      expect(env.DISPLAY).toBe(process.env.DISPLAY);
     });
 
     it('should throw if config has insecure permissions', async () => {
@@ -530,7 +545,7 @@ describe('SSHClient', () => {
 
       expect(client._spawn).toHaveBeenCalledWith(
         'ssh',
-        ['-o', 'StrictHostKeyChecking=accept-new', 'test', 'echo hello'],
+        ['-o', 'StrictHostKeyChecking=accept-new', '--', 'test', 'echo hello'],
         expect.any(Object)
       );
       expect(result).toEqual({ stdout: 'hello\n', stderr: '', code: 0 });
@@ -628,6 +643,63 @@ describe('SSHClient', () => {
       expect(result.stdout).toContain('[Output truncated');
     });
 
+    it('should reject hostAlias starting with - to block ProxyCommand injection', async () => {
+      client._spawn = createMockSpawn({ stdout: 'pwned', code: 0 });
+
+      await expect(
+        client.runRemoteCommand('-oProxyCommand=touch /tmp/pwned', 'echo')
+      ).rejects.toThrow(/Invalid hostAlias/);
+      expect(client._spawn).not.toHaveBeenCalled();
+    });
+
+    it('should reject hostAlias containing shell metacharacters (Windows cmd.exe vector)', async () => {
+      client._spawn = createMockSpawn({ stdout: '', code: 0 });
+
+      for (const evil of ['foo & calc.exe', 'foo|calc', 'foo;ls', 'foo`id`', 'foo$(id)', 'foo"bar', "foo'bar"]) {
+        await expect(client.runRemoteCommand(evil, 'ls')).rejects.toThrow(/Invalid hostAlias/);
+      }
+      expect(client._spawn).not.toHaveBeenCalled();
+    });
+
+    it('should reject unknown hostAlias that is not in ssh config or known_hosts', async () => {
+      readFile
+        .mockResolvedValueOnce(`Host test\n    HostName 1.2.3.4\n`)
+        .mockResolvedValueOnce('');
+      client._spawn = createMockSpawn({ stdout: '', code: 0 });
+
+      await expect(client.runRemoteCommand('unknown.example.com', 'ls')).rejects.toThrow(/Unknown hostAlias/);
+      expect(client._spawn).not.toHaveBeenCalled();
+    });
+
+    it('should allow user@alias when alias exists in ssh config', async () => {
+      client._spawn = createMockSpawn({ stdout: 'ok\n', code: 0 });
+
+      const result = await client.runRemoteCommand('root@test', 'whoami');
+
+      expect(client._spawn).toHaveBeenCalledWith(
+        'ssh',
+        ['-o', 'StrictHostKeyChecking=accept-new', '--', 'root@test', 'whoami'],
+        expect.any(Object)
+      );
+      expect(result.code).toBe(0);
+    });
+
+    it('should allow hosts discovered through Include directives', async () => {
+      readFile.mockImplementation(async (filePath) => {
+        if (String(filePath).endsWith('/config')) return SAMPLE_SSH_CONFIG_WITH_INCLUDE;
+        if (String(filePath).endsWith('.conf')) return `Host included\n    HostName 10.10.10.10\n`;
+        if (String(filePath).endsWith('known_hosts')) return '';
+        return '';
+      });
+      client.configParser.expandIncludePath = vi.fn(() => ['/tmp/included.conf']);
+      client._spawn = createMockSpawn({ stdout: 'ok\n', code: 0 });
+
+      const result = await client.runRemoteCommand('included', 'hostname');
+
+      expect(client._spawn).toHaveBeenCalled();
+      expect(result.code).toBe(0);
+    });
+
     it('should truncate stderr exceeding 10MB', async () => {
       client._spawn = vi.fn(() => {
         const child = new EventEmitter();
@@ -718,7 +790,7 @@ describe('SSHClient', () => {
       expect(result).toBe(true);
       expect(client._execFileAsync).toHaveBeenCalledWith(
         'scp',
-        ['-o', 'StrictHostKeyChecking=accept-new', '/local/file', 'test:/remote/file'],
+        ['-o', 'StrictHostKeyChecking=accept-new', '--', '/local/file', 'test:/remote/file'],
         expect.any(Object)
       );
     });
@@ -742,6 +814,25 @@ describe('SSHClient', () => {
       const opts = client._execFileAsync.mock.calls[0][2];
       expect(opts.env.MCP_SSH_PASS).toBe('killer99');
     });
+
+    it('should reject hostAlias starting with - to block ProxyCommand injection', async () => {
+      client._execFileAsync = createMockExecFileAsync();
+
+      const result = await client.uploadFile('-oProxyCommand=touch /tmp/pwned', '/local/file', '/remote/file');
+      expect(result).toBe(false);
+      expect(client._execFileAsync).not.toHaveBeenCalled();
+    });
+
+    it('should reject unknown hostAlias for uploads', async () => {
+      readFile
+        .mockResolvedValueOnce(`Host test\n    HostName 1.2.3.4\n`)
+        .mockResolvedValueOnce('');
+      client._execFileAsync = createMockExecFileAsync();
+
+      const result = await client.uploadFile('unknown.example.com', '/local/file', '/remote/file');
+      expect(result).toBe(false);
+      expect(client._execFileAsync).not.toHaveBeenCalled();
+    });
   });
 
   describe('downloadFile', () => {
@@ -756,7 +847,7 @@ describe('SSHClient', () => {
       expect(result).toBe(true);
       expect(client._execFileAsync).toHaveBeenCalledWith(
         'scp',
-        ['-o', 'StrictHostKeyChecking=accept-new', 'test:/remote/file', '/local/file'],
+        ['-o', 'StrictHostKeyChecking=accept-new', '--', 'test:/remote/file', '/local/file'],
         expect.any(Object)
       );
     });
@@ -766,6 +857,25 @@ describe('SSHClient', () => {
 
       const result = await client.downloadFile('test', '/remote/file', '/local/file');
       expect(result).toBe(false);
+    });
+
+    it('should reject hostAlias starting with - to block ProxyCommand injection', async () => {
+      client._execFileAsync = createMockExecFileAsync();
+
+      const result = await client.downloadFile('-oProxyCommand=touch /tmp/pwned', '/remote/file', '/local/file');
+      expect(result).toBe(false);
+      expect(client._execFileAsync).not.toHaveBeenCalled();
+    });
+
+    it('should allow hostnames learned from known_hosts for downloads', async () => {
+      readFile
+        .mockResolvedValueOnce(`Host test\n    HostName 1.2.3.4\n`)
+        .mockResolvedValueOnce('10.0.0.1 ssh-rsa AAAAB3Nz...\n');
+      client._execFileAsync = createMockExecFileAsync();
+
+      const result = await client.downloadFile('10.0.0.1', '/remote/file', '/local/file');
+      expect(result).toBe(true);
+      expect(client._execFileAsync).toHaveBeenCalled();
     });
   });
 

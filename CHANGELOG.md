@@ -5,6 +5,20 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.3.5] - 2026-04-11
+
+### Security
+- **SECURITY FIX (high)**: Fixed SSH `ProxyCommand` option-injection that allowed local RCE on the machine running the MCP server. A crafted `hostAlias` such as `-oProxyCommand=...` was passed to `ssh`/`scp` without an argument-terminator, so SSH interpreted it as an option and executed the attacker's command locally — bypassing the documented protection of `# @password:` annotations and exposing local SSH keys and credentials.
+- **SECURITY FIX (high, Windows-only)**: Fixed a second local-RCE vector on Windows. `runRemoteCommand`, `uploadFile` and `downloadFile` previously used `spawn(..., { shell: true })` so that `ssh.exe`/`scp.exe` could be found via PATH. With `shell: true` every argument is re-parsed by `cmd.exe`, so shell metacharacters (`&`, `|`, `^`, `>`, `"`, `;`, etc.) in `hostAlias`, `command`, `localPath` or `remotePath` would have been interpreted by `cmd.exe` and could trigger arbitrary local command execution. The server now resolves `ssh.exe`/`scp.exe` to absolute paths once at startup (via PATH + PATHEXT walk) and uses `shell: false` everywhere.
+- **Hardening**: Added a strict whitelist for `hostAlias` (`^[A-Za-z0-9_.@:][A-Za-z0-9._@:-]*$`). Rejects leading `-` (option injection) and all shell metacharacters (cmd.exe injection). Applied to `runRemoteCommand`, `uploadFile`, `downloadFile` (and transitively to `checkConnectivity` and `runCommandBatch`).
+- **Hardening**: Added a known-host check (`_assertKnownHostAlias`) that requires every `hostAlias` to be defined in `~/.ssh/config` (including Include directives) or present in `~/.ssh/known_hosts`. The LLM can no longer reach arbitrary hostnames the user has not explicitly configured — Whitelist instead of Blacklist.
+- **Hardening**: Added `--` argument terminator to all `ssh`/`scp` invocations as defense in depth.
+- **Fix**: Removed the hard-coded `DISPLAY=:0` value from the SSH askpass environment. It was a POSIX/X11 assumption that could break behavior on Windows; `SSH_ASKPASS_REQUIRE=force` is sufficient on its own.
+- **Fix**: `expandIncludePath()` now handles Windows drive-letter and UNC paths correctly (`path.isAbsolute` + `path.win32.isAbsolute`) and accepts `~\path` with a backslash separator.
+- Added regression tests for the option-injection vector and shell-metacharacter vector across all five affected tools.
+- Documented the tool's threat model and trust boundaries in `README.md` (`runRemoteCommand` is by-design remote RCE; `uploadFile`/`downloadFile` expose the local filesystem with the server process's privileges; recommend running under an unprivileged user or in a container).
+- Reported by Pico (`piiiico` on GitHub) as part of an MCP server security audit. Thank you for the responsible disclosure.
+
 ## [1.1.0] - 2025-08-17
 
 ### Added
