@@ -3,9 +3,14 @@ src/
 tsconfig.json
 .vscode/
 IMPLEMENTATION_NOTES.md
+dev/
+build/
+.dxtignore
+.gitattributes
 
 # Documentation images (keep README.md)
 doc/
+SSH_MCP_*.html
 
 # Development scripts
 start.sh

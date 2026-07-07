@@ -1,55 +1,54 @@
-#!/bin/bash
+#!/usr/bin/env bash
 
-# Build script for creating DXT packages for mcp-ssh
-# This script creates .dxt files for distribution without committing them to the repository
+# Build script for creating DXT packages for mcp-ssh.
+# This script creates .dxt files for distribution without committing them.
 
-set -e
+set -euo pipefail
 
-# Colors for output
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
-NC='\033[0m' # No Color
+NC='\033[0m'
 
 echo -e "${GREEN}Building MCP SSH DXT Package${NC}"
 
-# Check if dxt CLI is available
-if ! command -v npx &> /dev/null; then
-    echo -e "${RED}Error: npm/npx not found. Please install Node.js${NC}"
-    exit 1
+if ! command -v npx >/dev/null 2>&1; then
+  echo -e "${RED}Error: npm/npx not found. Please install Node.js.${NC}"
+  exit 1
 fi
 
-# Check if we have the dxt package
-if ! npm list @anthropic-ai/dxt &> /dev/null; then
-    echo -e "${RED}Error: @anthropic-ai/dxt not found. Please run 'npm install'${NC}"
-    exit 1
+if ! npm list @anthropic-ai/dxt >/dev/null 2>&1; then
+  echo -e "${RED}Error: @anthropic-ai/dxt not found. Please run 'npm install'.${NC}"
+  exit 1
 fi
 
-# Create build directory (not tracked in git)
+VERSION=$(npm pkg get version | tr -d '"')
 BUILD_DIR="build"
+STAGE_DIR="$BUILD_DIR/dxt-stage"
+DXT_FILE="mcp-ssh-${VERSION}.dxt"
+DXT_PATH="$BUILD_DIR/$DXT_FILE"
+
 rm -rf "$BUILD_DIR"
-mkdir -p "$BUILD_DIR"
+mkdir -p "$STAGE_DIR"
+
+echo -e "${YELLOW}Preparing DXT staging directory...${NC}"
+
+cp package.json package-lock.json manifest.json server.mjs README.md CHANGELOG.md LICENSE "$STAGE_DIR/"
+cp -R bin doc "$STAGE_DIR/"
+
+echo -e "${YELLOW}Installing production dependencies...${NC}"
+(cd "$STAGE_DIR" && npm install --omit=dev --omit=optional --ignore-scripts)
 
 echo -e "${YELLOW}Creating DXT package...${NC}"
+npx dxt pack "$STAGE_DIR" "$DXT_PATH"
 
-# Get version from package.json
-VERSION=$(node -p "require('./package.json').version")
-DXT_FILE="mcp-ssh-${VERSION}.dxt"
+rm -rf "$STAGE_DIR"
 
-# Create the DXT package
-npx dxt pack . "$BUILD_DIR/$DXT_FILE"
+echo -e "${GREEN}DXT package created successfully: $DXT_PATH${NC}"
+echo -e "${GREEN}Package size: $(ls -lh "$DXT_PATH" | awk '{print $5}')${NC}"
 
-if [ $? -eq 0 ]; then
-    echo -e "${GREEN}✓ DXT package created successfully: $BUILD_DIR/$DXT_FILE${NC}"
-    echo -e "${GREEN}✓ Package size: $(ls -lh "$BUILD_DIR/$DXT_FILE" | awk '{print $5}')${NC}"
-    
-    # Display next steps
-    echo -e "\n${YELLOW}Next steps:${NC}"
-    echo "1. Test the DXT package locally"
-    echo "2. Upload to GitHub releases:"
-    echo "   gh release create v${VERSION} $BUILD_DIR/$DXT_FILE --title 'Release v${VERSION}' --notes 'MCP SSH Agent v${VERSION}'"
-    echo "3. Or upload manually to GitHub releases page"
-else
-    echo -e "${RED}✗ Failed to create DXT package${NC}"
-    exit 1
-fi
+echo -e "\n${YELLOW}Next steps:${NC}"
+echo "1. Test the DXT package locally"
+echo "2. Upload to GitHub releases:"
+echo "   gh release create v${VERSION} $DXT_PATH --title 'Release v${VERSION}' --notes 'MCP SSH Agent v${VERSION}'"
+echo "3. Or upload manually to GitHub releases page"

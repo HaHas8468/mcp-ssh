@@ -25,7 +25,7 @@ The package is automatically published when you create a GitHub release:
 git checkout main
 git pull origin main
 
-# 2. Bump the version (patch, minor, or major)
+# 2. Bump the version if needed
 npm version patch  # or minor/major
 
 # 3. Publish to npm
@@ -40,14 +40,25 @@ git push origin main --tags
 ```bash
 # Test the package locally
 npm pack
-npm install -g ./aiondadotcom-mcp-ssh-1.0.0.tgz
+npm install -g ./aiondadotcom-mcp-ssh-*.tgz
 
 # Test the binary
-mcp-ssh --help
+mcp-ssh
 
 # Clean up
 npm uninstall -g @aiondadotcom/mcp-ssh
 rm *.tgz
+```
+
+### Desktop Extension Package
+
+```bash
+# Build a .dxt package named from package.json version
+npm run build:dxt
+
+# Example release command
+VERSION=$(node -p "require('./package.json').version")
+gh release create "v${VERSION}" "build/mcp-ssh-${VERSION}.dxt" --title "Release v${VERSION}" --notes "MCP SSH Agent v${VERSION}"
 ```
 
 ## First-Time Setup

@@ -1,8 +1,8 @@
 {
   "dxt_version": "0.1",
   "name": "mcp-ssh",
-  "version": "1.0.4",
-  "description": "Connect to SSH hosts, run commands, and transfer files securely through Claude Desktop",
+  "version": "2.0.0",
+  "description": "Connect to SSH hosts, run commands, edit files, transfer data, and manage remote tasks through Claude Desktop",
   "author": {
     "name": "aionda.com",
     "url": "https://aionda.com"

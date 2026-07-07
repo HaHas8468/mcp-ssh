@@ -42,7 +42,7 @@ This is MCP SSH Agent (@aiondadotcom/mcp-ssh) - a Model Context Protocol (MCP) s
 2. **Self-contained**: `server.mjs` includes all code inline to avoid ESM import issues
 3. **Silent Mode**: Controlled by `MCP_SILENT` environment variable to disable debug output when used as MCP server
 4. **No shell on spawn**: All `spawn`/`execFile` calls use `shell: false`. On Windows, `ssh.exe`/`scp.exe` are resolved to absolute paths once at startup via `resolveExecutable()` (PATH + PATHEXT walk), so PATH lookup does not require `shell: true`. This is required to prevent local command injection through shell metacharacters in tool arguments.
-5. **Strict `hostAlias` whitelist**: `_assertSafeHostAlias()` (`SSHClient`) rejects any `hostAlias` that does not match `^[A-Za-z0-9_.@:][A-Za-z0-9._@:-]*$`. Combined with the `--` argument terminator on every `ssh`/`scp` invocation, this blocks SSH option injection (e.g. `-oProxyCommand=…`) and shell-metacharacter injection. Validation is applied at the public entry points (`runRemoteCommand`, `uploadFile`, `downloadFile`) and transitively covers `checkConnectivity` and `runCommandBatch`. **Do not weaken or bypass this validator** without understanding the security implications — see CHANGELOG entry for 1.3.5.
+5. **Strict `hostAlias` whitelist**: `_assertSafeHostAlias()` (`SSHClient`) rejects any `hostAlias` that does not match `^[A-Za-z0-9_.@:][A-Za-z0-9._@:-]*$`. Combined with the `--` argument terminator on every `ssh`/`scp` invocation, this blocks SSH option injection (e.g. `-oProxyCommand=…`) and shell-metacharacter injection. Validation is applied at the public SSH/SCP entry points and transitively covers the 6 MCP tools. **Do not weaken or bypass this validator** without understanding the security implications — see CHANGELOG entry for 1.3.5.
 
 ## SSH Configuration Integration
 
@@ -72,13 +72,12 @@ Host myrouter
 
 ## MCP Tools Provided
 
-1. **listKnownHosts()** - Lists all discovered SSH hosts
-2. **runRemoteCommand(hostAlias, command)** - Execute commands via SSH
-3. **getHostInfo(hostAlias)** - Get host configuration details
-4. **checkConnectivity(hostAlias)** - Test SSH connectivity
-5. **uploadFile(hostAlias, localPath, remotePath)** - Upload files via SCP
-6. **downloadFile(hostAlias, remotePath, localPath)** - Download files via SCP
-7. **runCommandBatch(hostAlias, commands)** - Execute multiple commands sequentially
+1. **ssh_hosts** - `list`, `info`, `check`, and `sessions` for host discovery and connection state
+2. **ssh_exec** - Run one command, a command batch, or parallel commands across hosts
+3. **ssh_file** - `read`, `write`, `edit`, and `append` remote file content
+4. **ssh_fs** - `list`, `stat`, `mkdir`, `rm`, and `mv` remote filesystem paths
+5. **ssh_transfer** - `upload` and `download` files or directories via SCP
+6. **ssh_task** - `start`, `status`, `stop`, and `list` long-running background tasks
 
 ## Testing and Debugging
 

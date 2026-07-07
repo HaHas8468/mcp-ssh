@@ -4,6 +4,10 @@ npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
 
+# Local analysis artifacts
+dev/
+SSH_MCP_*.html
+
 # Runtime data
 pids
 *.pid

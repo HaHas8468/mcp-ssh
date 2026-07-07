@@ -5,6 +5,18 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.0.0] - 2026-07-07
+
+### Changed
+- Consolidated the SSH MCP surface into 6 action-based tools: `ssh_hosts`, `ssh_exec`, `ssh_file`, `ssh_fs`, `ssh_transfer`, and `ssh_task`.
+- Grouped related host, command, file, filesystem, transfer, and background-task operations behind clear `action` parameters so coding agents have fewer tools to choose from.
+- Updated MCP tool descriptions with action docs, examples, and structured result expectations.
+- Declared both `tools` and `resources` capabilities for the MCP server.
+
+### Added
+- Added remote file content operations (`read`, `write`, `edit`, `append`) and remote filesystem operations (`list`, `stat`, `mkdir`, `rm`, `mv`) under the merged tool model.
+- Added background task management through `ssh_task`.
+
 ## [1.3.8] - 2026-04-14
 
 ### Fixed

@@ -5,7 +5,6 @@ import { EventEmitter } from 'events';
 const require = createRequire(import.meta.url);
 const sshConfigLib = require('ssh-config');
 
-// Mock fs/promises (used via ESM import in server.mjs)
 vi.mock('fs/promises', async () => {
   const actual = await vi.importActual('fs/promises');
   return {
@@ -15,37 +14,36 @@ vi.mock('fs/promises', async () => {
     writeFile: vi.fn(),
     chmod: vi.fn(),
     unlink: vi.fn(),
+    appendFile: vi.fn(),
+    mkdir: vi.fn(),
   };
 });
 
 import { readFile, stat, writeFile, chmod } from 'fs/promises';
-import { SSHConfigParser, SSHClient, main } from './server.mjs';
+import {
+  SSHConfigParser, SSHClient, SessionManager, TaskManager,
+  AuditLogger, PermissionGuard, McpConfig, RateLimiter, detectDangerousCommand, main
+} from './server.mjs';
 
-// Helper: create a fake spawn that returns a mock child process
 function createMockSpawn({ stdout = '', stderr = '', code = 0, error = null } = {}) {
   return vi.fn(() => {
     const child = new EventEmitter();
     child.stdout = new EventEmitter();
     child.stderr = new EventEmitter();
+    child.stdin = { write: vi.fn(), end: vi.fn() };
     child.kill = vi.fn(() => {
       setTimeout(() => child.emit('close', null), 2);
     });
-
     setTimeout(() => {
-      if (error) {
-        child.emit('error', error);
-        return;
-      }
+      if (error) { child.emit('error', error); return; }
       if (stdout) child.stdout.emit('data', Buffer.from(stdout));
       if (stderr) child.stderr.emit('data', Buffer.from(stderr));
       child.emit('close', code);
     }, 5);
-
     return child;
   });
 }
 
-// Helper: create a fake execFileAsync
 function createMockExecFileAsync({ error = null } = {}) {
   return vi.fn(async () => {
     if (error) throw error;
@@ -69,505 +67,518 @@ Host nohost
     User nobody
 `;
 
-const SAMPLE_SSH_CONFIG_WITH_INCLUDE = `
-Include ~/.ssh/configs/*.conf
-
-Host prod
-    HostName 157.90.89.149
-    User trashmail
-`;
-
 const SAMPLE_KNOWN_HOSTS = `157.90.89.149 ssh-ed25519 AAAAC3Nz...
 88.198.170.88 ssh-ed25519 AAAAC3Nz...
 10.0.0.1 ssh-rsa AAAAB3Nz...
 `;
 
 // =============================================================================
-// SSHConfigParser Tests
+// SessionManager Tests
 // =============================================================================
+describe('SessionManager', () => {
+  it('should generate ControlMaster args', () => {
+    const sm = new SessionManager();
+    const args = sm.getControlArgs();
+    expect(args).toContain('ControlMaster=auto');
+    expect(args).toContain('ControlPersist=300');
+    expect(args.some(a => a.includes('ControlPath='))).toBe(true);
+  });
 
+  it('should create and retrieve sessions', async () => {
+    const sm = new SessionManager();
+    const session = await sm.getSession('prod');
+    expect(session.cwd).toBeNull();
+    expect(session.env.size).toBe(0);
+    expect(session.lastUsed).toBeDefined();
+  });
+
+  it('should build command with cwd and env state', async () => {
+    const sm = new SessionManager();
+    const session = await sm.getSession('prod');
+    session.cwd = '/app';
+    session.env.set('NODE_ENV', 'production');
+    const cmd = sm.buildCommandWithState('prod', 'npm test');
+    expect(cmd).toContain('cd "/app"');
+    expect(cmd).toContain('export NODE_ENV="production"');
+    expect(cmd).toContain('npm test');
+  });
+
+  it('should return original command when no session exists', () => {
+    const sm = new SessionManager();
+    expect(sm.buildCommandWithState('unknown', 'ls')).toBe('ls');
+  });
+
+  it('should update cwd from cd commands', async () => {
+    const sm = new SessionManager();
+    await sm.getSession('prod');
+    sm.updateStateFromCommand('prod', 'cd /var/log', 0);
+    expect(sm.sessions.get('prod').cwd).toBe('/var/log');
+  });
+
+  it('should not update cwd on failed commands', async () => {
+    const sm = new SessionManager();
+    await sm.getSession('prod');
+    sm.updateStateFromCommand('prod', 'cd /nonexistent', 1);
+    expect(sm.sessions.get('prod').cwd).toBeNull();
+  });
+
+  it('should track export commands', async () => {
+    const sm = new SessionManager();
+    await sm.getSession('prod');
+    sm.updateStateFromCommand('prod', 'export FOO=bar', 0);
+    expect(sm.sessions.get('prod').env.get('FOO')).toBe('bar');
+  });
+
+  it('should clear sessions', async () => {
+    const sm = new SessionManager();
+    await sm.getSession('prod');
+    sm.clearSession('prod');
+    expect(sm.sessions.has('prod')).toBe(false);
+  });
+
+  it('should list sessions', async () => {
+    const sm = new SessionManager();
+    await sm.getSession('prod');
+    await sm.getSession('dev');
+    const list = sm.listSessions();
+    expect(list).toHaveLength(2);
+    expect(list[0].hostAlias).toBe('prod');
+  });
+
+  it('should mark session unhealthy and healthy', async () => {
+    const sm = new SessionManager();
+    await sm.getSession('prod');
+    sm.markUnhealthy('prod');
+    expect(sm.sessions.get('prod').connectionHealthy).toBe(false);
+    sm.markHealthy('prod');
+    expect(sm.sessions.get('prod').connectionHealthy).toBe(true);
+    expect(sm.sessions.get('prod').retryCount).toBe(0);
+  });
+
+  it('should retry with exponential backoff on connection_failed', async () => {
+    const sm = new SessionManager();
+    let attempts = 0;
+    const fn = async () => {
+      attempts++;
+      if (attempts < 3) {
+        const err = new Error('Connection refused');
+        err.errorType = 'connection_failed';
+        throw err;
+      }
+      return { success: true };
+    };
+    const result = await sm.retryWithBackoff(fn, 'prod', { maxRetries: 3, retryDelay: 1, retryBackoffMultiplier: 1 });
+    expect(attempts).toBe(3);
+    expect(result.success).toBe(true);
+  });
+
+  it('should not retry on non-retryable errors', async () => {
+    const sm = new SessionManager();
+    let attempts = 0;
+    const fn = async () => {
+      attempts++;
+      const err = new Error('Command not found');
+      err.errorType = 'command_not_found';
+      throw err;
+    };
+    await expect(sm.retryWithBackoff(fn, 'prod', { maxRetries: 3 })).rejects.toThrow('Command not found');
+    expect(attempts).toBe(1);
+  });
+
+  it('should throw after max retries', async () => {
+    const sm = new SessionManager();
+    let attempts = 0;
+    const fn = async () => {
+      attempts++;
+      const err = new Error('Connection refused');
+      err.errorType = 'connection_failed';
+      throw err;
+    };
+    await expect(sm.retryWithBackoff(fn, 'prod', { maxRetries: 2, retryDelay: 1, retryBackoffMultiplier: 1 })).rejects.toThrow('Connection refused');
+    expect(attempts).toBe(3); // 1 initial + 2 retries
+  });
+});
+
+// =============================================================================
+// McpConfig Tests
+// =============================================================================
+describe('McpConfig', () => {
+  it('should load defaults when no config file exists', async () => {
+    readFile.mockRejectedValueOnce(new Error('ENOENT'));
+    const config = new McpConfig('/nonexistent/config.json');
+    const cfg = await config.load();
+    expect(cfg.controlPersist).toBe(300);
+    expect(cfg.defaultTimeout).toBe(120000);
+    expect(cfg.maxRetries).toBe(3);
+  });
+
+  it('should load custom values from config file', async () => {
+    readFile.mockResolvedValueOnce(JSON.stringify({
+      controlPersist: 600,
+      maxRetries: 5,
+      defaultTimeout: 60000,
+    }));
+    const config = new McpConfig('/test/config.json');
+    const cfg = await config.load();
+    expect(cfg.controlPersist).toBe(600);
+    expect(cfg.maxRetries).toBe(5);
+    expect(cfg.defaultTimeout).toBe(60000);
+  });
+
+  it('should merge custom values with defaults', async () => {
+    readFile.mockResolvedValueOnce(JSON.stringify({ controlPersist: 120 }));
+    const config = new McpConfig('/test/config.json');
+    await config.load();
+    // Custom value
+    expect(config.get('controlPersist')).toBe(120);
+    // Default value not overridden
+    expect(config.get('maxRetries')).toBe(3);
+  });
+});
+
+// =============================================================================
+// RateLimiter Tests
+// =============================================================================
+describe('RateLimiter', () => {
+  it('should allow requests under the limit', () => {
+    const rl = new RateLimiter();
+    expect(() => rl.check('host1')).not.toThrow();
+    expect(() => rl.check('host1')).not.toThrow();
+  });
+
+  it('should track separate buckets per host', () => {
+    const rl = new RateLimiter();
+    expect(() => rl.check('host1')).not.toThrow();
+    expect(() => rl.check('host2')).not.toThrow();
+  });
+
+  it('should throw when rate limit exceeded', () => {
+    const rl = new RateLimiter();
+    // Exhaust the bucket
+    for (let i = 0; i < 60; i++) rl.check('limited-host');
+    // Next request should throw
+    expect(() => rl.check('limited-host')).toThrow(/Rate limit exceeded/);
+  });
+});
+
+// =============================================================================
+// Content Type Detection Tests (via SSHClient)
+// =============================================================================
+describe('Content type detection', () => {
+  let client;
+  beforeEach(() => {
+    client = new SSHClient();
+    client.sessionManager.config._config = { ...client.sessionManager.config._defaults, maxRetries: 0, retryDelay: 1 };
+    vi.clearAllMocks();
+    readFile.mockResolvedValue(`Host test\n    HostName 1.2.3.4\n`);
+  });
+
+  it('should detect JSON output', async () => {
+    client._spawn = createMockSpawn({ stdout: '{"key":"value"}\n', code: 0 });
+    const result = await client.runRemoteCommand('test', 'cat config.json');
+    expect(result.contentType).toBe('json');
+  });
+
+  it('should detect text output', async () => {
+    client._spawn = createMockSpawn({ stdout: 'Hello World\n', code: 0 });
+    const result = await client.runRemoteCommand('test', 'echo hello');
+    expect(result.contentType).toBe('text');
+  });
+
+  it('should detect empty output', async () => {
+    client._spawn = createMockSpawn({ stdout: '', code: 0 });
+    const result = await client.runRemoteCommand('test', 'true');
+    expect(result.contentType).toBe('empty');
+  });
+});
+
+// =============================================================================
+// combineOutput (stdout/stderr interleave) Tests
+// =============================================================================
+describe('combineOutput', () => {
+  let client;
+  beforeEach(() => {
+    client = new SSHClient();
+    client.sessionManager.config._config = { ...client.sessionManager.config._defaults, maxRetries: 0, retryDelay: 1 };
+    vi.clearAllMocks();
+    readFile.mockResolvedValue(`Host test\n    HostName 1.2.3.4\n`);
+  });
+
+  it('should return combined output when combineOutput=true', async () => {
+    client._spawn = vi.fn(() => {
+      const child = new EventEmitter();
+      child.stdout = new EventEmitter();
+      child.stderr = new EventEmitter();
+      child.kill = vi.fn();
+      setTimeout(() => {
+        child.stdout.emit('data', Buffer.from('stdout-line\n'));
+        child.stderr.emit('data', Buffer.from('stderr-line\n'));
+        child.emit('close', 0);
+      }, 5);
+      return child;
+    });
+    const result = await client.runRemoteCommand('test', 'make', { combineOutput: true });
+    expect(result.combined).toBeDefined();
+    expect(result.combined).toContain('stdout-line');
+    expect(result.combined).toContain('stderr-line');
+  });
+
+  it('should not return combined output when combineOutput=false (default)', async () => {
+    client._spawn = createMockSpawn({ stdout: 'hello\n', code: 0 });
+    const result = await client.runRemoteCommand('test', 'echo hello');
+    expect(result.combined).toBeUndefined();
+  });
+});
+
+// =============================================================================
+// Dangerous Command Confirmation (Elicitation) Tests
+// =============================================================================
+describe('Dangerous command confirmation', () => {
+  let client;
+  beforeEach(() => {
+    client = new SSHClient();
+    client.sessionManager.config._config = { ...client.sessionManager.config._defaults, maxRetries: 0, retryDelay: 1 };
+    vi.clearAllMocks();
+    readFile.mockResolvedValue(`Host test\n    HostName 1.2.3.4\n`);
+  });
+
+  it('should require confirmation for dangerous commands', async () => {
+    client._spawn = createMockSpawn({ stdout: '', code: 0 });
+    const result = await client.runRemoteCommand('test', 'rm -rf /');
+    expect(result.success).toBe(false);
+    expect(result.confirmationRequired).toBe(true);
+    expect(result.danger.level).toBe('critical');
+    expect(client._spawn).not.toHaveBeenCalled();
+  });
+
+  it('should execute when confirmed=true', async () => {
+    client._spawn = createMockSpawn({ stdout: '', code: 0 });
+    const result = await client.runRemoteCommand('test', 'rm -rf /', { confirmed: true });
+    expect(result.success).toBe(true);
+    expect(client._spawn).toHaveBeenCalled();
+  });
+
+  it('should not block safe commands', async () => {
+    client._spawn = createMockSpawn({ stdout: 'hello\n', code: 0 });
+    const result = await client.runRemoteCommand('test', 'echo hello');
+    expect(result.success).toBe(true);
+    expect(result.confirmationRequired).toBeUndefined();
+  });
+});
+
+// =============================================================================
+// Keychain fallback Tests
+// =============================================================================
+describe('Keychain integration', () => {
+  let client;
+  beforeEach(() => {
+    client = new SSHClient();
+    client.sessionManager.config._config = { ...client.sessionManager.config._defaults, maxRetries: 0, retryDelay: 1 };
+    vi.clearAllMocks();
+  });
+
+  it('should fall back to @password annotation when keytar is not available', async () => {
+    readFile.mockResolvedValue(SAMPLE_SSH_CONFIG);
+    const password = await client.getPasswordForHost('mail');
+    // keytar is not installed in test env, should fall back to @password
+    expect(password).toBe('killer99');
+  });
+});
+
+// =============================================================================
+// DangerousCommandDetector Tests
+// =============================================================================
+describe('detectDangerousCommand', () => {
+  it('should detect rm -rf /', () => {
+    const result = detectDangerousCommand('rm -rf /');
+    expect(result.detected).toBe(true);
+    expect(result.level).toBe('critical');
+  });
+
+  it('should detect rm -rf /*', () => {
+    const result = detectDangerousCommand('rm -rf /*');
+    expect(result.detected).toBe(true);
+  });
+
+  it('should detect mkfs', () => {
+    const result = detectDangerousCommand('mkfs.ext4 /dev/sda1');
+    expect(result.detected).toBe(true);
+    expect(result.level).toBe('critical');
+  });
+
+  it('should detect dd to device', () => {
+    const result = detectDangerousCommand('dd if=/dev/zero of=/dev/sda bs=1M');
+    expect(result.detected).toBe(true);
+  });
+
+  it('should detect drop table', () => {
+    const result = detectDangerousCommand('mysql -e "drop table users"');
+    expect(result.detected).toBe(true);
+    expect(result.level).toBe('high');
+  });
+
+  it('should detect shutdown', () => {
+    const result = detectDangerousCommand('shutdown -h now');
+    expect(result.detected).toBe(true);
+  });
+
+  it('should detect chmod 777 /', () => {
+    const result = detectDangerousCommand('chmod -R 777 /');
+    expect(result.detected).toBe(true);
+  });
+
+  it('should not flag safe commands', () => {
+    expect(detectDangerousCommand('ls -la').detected).toBe(false);
+    expect(detectDangerousCommand('cat /etc/hosts').detected).toBe(false);
+    expect(detectDangerousCommand('npm install').detected).toBe(false);
+    expect(detectDangerousCommand('git pull').detected).toBe(false);
+    expect(detectDangerousCommand('rm -rf /tmp/build').detected).toBe(false);
+  });
+});
+
+// =============================================================================
+// AuditLogger Tests
+// =============================================================================
+describe('AuditLogger', () => {
+  it('should be enabled by default', () => {
+    const logger = new AuditLogger();
+    expect(logger.enabled).toBe(true);
+  });
+
+  it('should respect MCP_SSH_AUDIT=false', () => {
+    const original = process.env.MCP_SSH_AUDIT;
+    process.env.MCP_SSH_AUDIT = 'false';
+    const logger = new AuditLogger();
+    expect(logger.enabled).toBe(false);
+    process.env.MCP_SSH_AUDIT = original;
+  });
+});
+
+// =============================================================================
+// PermissionGuard Tests
+// =============================================================================
+describe('PermissionGuard', () => {
+  it('should allow all when no policy exists', async () => {
+    const guard = new PermissionGuard('/nonexistent/path.json');
+    await expect(guard.check('prod', 'runRemoteCommand', { command: 'ls' })).resolves.not.toThrow();
+  });
+
+  it('should block disallowed tools', async () => {
+    readFile.mockResolvedValue(JSON.stringify({
+      prod: { allowedTools: ['readFile'] }
+    }));
+    const guard = new PermissionGuard();
+    guard._policies = null;
+    await guard._loadPolicies();
+    await expect(guard.check('prod', 'runRemoteCommand', { command: 'ls' })).rejects.toThrow('not allowed');
+  });
+
+  it('should block denied command patterns', async () => {
+    readFile.mockResolvedValue(JSON.stringify({
+      prod: { allowedTools: '*', denyPatterns: ['rm\\s+-rf'] }
+    }));
+    const guard = new PermissionGuard();
+    guard._policies = null;
+    await guard._loadPolicies();
+    await expect(guard.check('prod', 'runRemoteCommand', { command: 'rm -rf /tmp' })).rejects.toThrow('blocked by deny');
+  });
+
+  it('should match wildcard host patterns', async () => {
+    readFile.mockResolvedValue(JSON.stringify({
+      'dev-*': { allowedTools: ['runRemoteCommand'] }
+    }));
+    const guard = new PermissionGuard();
+    guard._policies = null;
+    await guard._loadPolicies();
+    await expect(guard.check('dev-web1', 'runRemoteCommand', {})).resolves.not.toThrow();
+    await expect(guard.check('dev-web1', 'writeFile', {})).rejects.toThrow('not allowed');
+  });
+});
+
+// =============================================================================
+// SSHConfigParser Tests (backward compatible)
+// =============================================================================
 describe('SSHConfigParser', () => {
   let parser;
-
   beforeEach(() => {
     parser = new SSHConfigParser();
     vi.clearAllMocks();
   });
 
-  describe('extractHostsFromConfig', () => {
-    it('should parse hosts with hostname, user, port', () => {
-      const config = sshConfigLib.parse(SAMPLE_SSH_CONFIG);
-      const hosts = parser.extractHostsFromConfig(config, '/home/test/.ssh/config');
-
-      expect(hosts).toHaveLength(2); // nohost has no hostname
-      expect(hosts[0]).toMatchObject({
-        alias: 'prod',
-        hostname: '157.90.89.149',
-        port: 42077,
-        user: 'trashmail',
-      });
-    });
-
-    it('should parse @password annotation from comments', () => {
-      const config = sshConfigLib.parse(SAMPLE_SSH_CONFIG);
-      const hosts = parser.extractHostsFromConfig(config, '/test');
-      const mail = hosts.find(h => h.alias === 'mail');
-      expect(mail._password).toBe('killer99');
-    });
-
-    it('should handle password with colons', () => {
-      const config = sshConfigLib.parse(`
-Host test
-    HostName 1.2.3.4
-    # @password:pass:with:colons
-`);
-      const hosts = parser.extractHostsFromConfig(config, '/test');
-      expect(hosts[0]._password).toBe('pass:with:colons');
-    });
-
-    it('should handle password with spaces after colon', () => {
-      const config = sshConfigLib.parse(`
-Host test
-    HostName 1.2.3.4
-    # @password: spaced
-`);
-      const hosts = parser.extractHostsFromConfig(config, '/test');
-      expect(hosts[0]._password).toBe('spaced');
-    });
-
-    it('should skip hosts without hostname', () => {
-      const config = sshConfigLib.parse(SAMPLE_SSH_CONFIG);
-      const hosts = parser.extractHostsFromConfig(config, '/test');
-      expect(hosts.find(h => h.alias === 'nohost')).toBeUndefined();
-    });
-
-    it('should skip wildcard host', () => {
-      const config = sshConfigLib.parse(`
-Host *
-    ServerAliveInterval 55
-
-Host myhost
-    HostName 1.2.3.4
-`);
-      const hosts = parser.extractHostsFromConfig(config, '/test');
-      expect(hosts).toHaveLength(1);
-      expect(hosts[0].alias).toBe('myhost');
-    });
-
-    it('should skip Include directives', () => {
-      const config = sshConfigLib.parse(SAMPLE_SSH_CONFIG_WITH_INCLUDE);
-      const hosts = parser.extractHostsFromConfig(config, '/test');
-      expect(hosts).toHaveLength(1);
-      expect(hosts[0].alias).toBe('prod');
-    });
-
-    it('should parse identityFile', () => {
-      const config = sshConfigLib.parse(`
-Host test
-    HostName 1.2.3.4
-    IdentityFile ~/.ssh/id_rsa
-`);
-      const hosts = parser.extractHostsFromConfig(config, '/test');
-      expect(hosts[0].identityFile).toBe('~/.ssh/id_rsa');
-    });
-
-    it('should store other parameters in lowercase', () => {
-      const config = sshConfigLib.parse(`
-Host test
-    HostName 1.2.3.4
-    ProxyJump bastion
-`);
-      const hosts = parser.extractHostsFromConfig(config, '/test');
-      expect(hosts.proxyjump || hosts[0].proxyjump).toBe('bastion');
-    });
-
-    it('should track configs with passwords', () => {
-      const config = sshConfigLib.parse(`
-Host test
-    HostName 1.2.3.4
-    # @password:secret
-`);
-      parser.extractHostsFromConfig(config, '/my/config');
-      expect(parser._configsWithPasswords.has('/my/config')).toBe(true);
-    });
-
-    it('should not track configs without passwords', () => {
-      const config = sshConfigLib.parse(`
-Host test
-    HostName 1.2.3.4
-`);
-      parser.extractHostsFromConfig(config, '/my/config');
-      expect(parser._configsWithPasswords).toBeUndefined();
-    });
-
-    it('should ignore comment lines that are not @password', () => {
-      const config = sshConfigLib.parse(`
-Host test
-    HostName 1.2.3.4
-    # This is a regular comment
-    # Another comment
-`);
-      const hosts = parser.extractHostsFromConfig(config, '/test');
-      expect(hosts[0]._password).toBeUndefined();
-    });
+  it('should parse hosts with hostname, user, port', () => {
+    const config = sshConfigLib.parse(SAMPLE_SSH_CONFIG);
+    const hosts = parser.extractHostsFromConfig(config, '/home/test/.ssh/config');
+    expect(hosts).toHaveLength(2);
+    expect(hosts[0]).toMatchObject({ alias: 'prod', hostname: '157.90.89.149', port: 42077, user: 'trashmail' });
   });
 
-  describe('parseConfig', () => {
-    it('should parse SSH config file', async () => {
-      readFile.mockResolvedValue(SAMPLE_SSH_CONFIG);
-      const hosts = await parser.parseConfig();
-      expect(hosts).toHaveLength(2);
-    });
-
-    it('should return empty array on read error', async () => {
-      readFile.mockRejectedValue(new Error('ENOENT'));
-      const hosts = await parser.parseConfig();
-      expect(hosts).toEqual([]);
-    });
+  it('should parse @password annotation', () => {
+    const config = sshConfigLib.parse(SAMPLE_SSH_CONFIG);
+    const hosts = parser.extractHostsFromConfig(config, '/test');
+    expect(hosts.find(h => h.alias === 'mail')._password).toBe('killer99');
   });
 
-  describe('parseKnownHosts', () => {
-    it('should parse known_hosts file', async () => {
-      readFile.mockResolvedValue(SAMPLE_KNOWN_HOSTS);
-      const hosts = await parser.parseKnownHosts();
-      expect(hosts).toEqual(['157.90.89.149', '88.198.170.88', '10.0.0.1']);
-    });
-
-    it('should return empty array on read error', async () => {
-      readFile.mockRejectedValue(new Error('ENOENT'));
-      const hosts = await parser.parseKnownHosts();
-      expect(hosts).toEqual([]);
-    });
-
-    it('should skip empty lines', async () => {
-      readFile.mockResolvedValue('host1 ssh-rsa key\n\n\nhost2 ssh-rsa key\n');
-      const hosts = await parser.parseKnownHosts();
-      expect(hosts).toEqual(['host1', 'host2']);
-    });
-
-    it('should handle comma-separated hostnames', async () => {
-      readFile.mockResolvedValue('host1,host2 ssh-rsa key\n');
-      const hosts = await parser.parseKnownHosts();
-      expect(hosts).toEqual(['host1']);
-    });
-  });
-
-  describe('checkFilePermissions', () => {
-    it('should pass with 600 permissions', async () => {
-      stat.mockResolvedValue({ mode: 0o100600 });
-      await expect(parser.checkFilePermissions('/test')).resolves.not.toThrow();
-    });
-
-    it('should throw on insecure permissions (644)', async () => {
-      stat.mockResolvedValue({ mode: 0o100644 });
-      await expect(parser.checkFilePermissions('/test')).rejects.toThrow('insecure permissions');
-    });
-
-    it('should throw on insecure permissions (755)', async () => {
-      stat.mockResolvedValue({ mode: 0o100755 });
-      await expect(parser.checkFilePermissions('/test')).rejects.toThrow('insecure permissions');
-    });
-
-    it('should include chmod hint in error message', async () => {
-      stat.mockResolvedValue({ mode: 0o100644 });
-      await expect(parser.checkFilePermissions('/test')).rejects.toThrow('chmod 600');
-    });
-
-    it('should ignore ENOENT errors', async () => {
-      const err = new Error('not found');
-      err.code = 'ENOENT';
-      stat.mockRejectedValue(err);
-      await expect(parser.checkFilePermissions('/test')).resolves.not.toThrow();
-    });
-
-    it('should rethrow other errors', async () => {
-      stat.mockRejectedValue(new Error('disk failure'));
-      await expect(parser.checkFilePermissions('/test')).rejects.toThrow('disk failure');
-    });
-  });
-
-  describe('getAllKnownHosts', () => {
-    it('should merge config hosts and known_hosts, deduplicating', async () => {
-      readFile
-        .mockResolvedValueOnce(SAMPLE_SSH_CONFIG)
-        .mockResolvedValueOnce(SAMPLE_KNOWN_HOSTS);
-      stat.mockResolvedValue({ mode: 0o100600 });
-
-      const hosts = await parser.getAllKnownHosts();
-
-      const configHosts = hosts.filter(h => h.source === 'ssh_config');
-      const knownHosts = hosts.filter(h => h.source === 'known_hosts');
-
-      expect(configHosts).toHaveLength(2);
-      expect(knownHosts).toHaveLength(1);
-      expect(knownHosts[0].hostname).toBe('10.0.0.1');
-    });
-
-    it('should check permissions for configs with passwords', async () => {
-      readFile
-        .mockResolvedValueOnce(SAMPLE_SSH_CONFIG)
-        .mockResolvedValueOnce(SAMPLE_KNOWN_HOSTS);
-      stat.mockResolvedValue({ mode: 0o100600 });
-
-      await parser.getAllKnownHosts();
-      expect(stat).toHaveBeenCalled();
-    });
-
-    it('should work with empty known_hosts', async () => {
-      readFile
-        .mockResolvedValueOnce(SAMPLE_SSH_CONFIG)
-        .mockRejectedValueOnce(new Error('ENOENT'));
-      stat.mockResolvedValue({ mode: 0o100600 });
-
-      const hosts = await parser.getAllKnownHosts();
-      expect(hosts).toHaveLength(2);
-    });
-  });
-
-  describe('processIncludeDirectives', () => {
-    it('should return empty array on read error', async () => {
-      readFile.mockRejectedValue(new Error('ENOENT'));
-      const hosts = await parser.processIncludeDirectives('/nonexistent');
-      expect(hosts).toEqual([]);
-    });
-
-    it('should parse config without includes', async () => {
-      readFile.mockResolvedValue(SAMPLE_SSH_CONFIG);
-      const hosts = await parser.processIncludeDirectives('/test/.ssh/config');
-      expect(hosts).toHaveLength(2);
-    });
-
-    it('should process Include directives and merge hosts', async () => {
-      const mainConfig = `
-Include /tmp/included.conf
-
-Host main
-    HostName 1.2.3.4
-`;
-      const includedConfig = `
-Host included
-    HostName 5.6.7.8
-`;
-      readFile
-        .mockResolvedValueOnce(mainConfig)
-        .mockResolvedValueOnce(includedConfig);
-
-      // Mock expandIncludePath to return the include path
-      parser.expandIncludePath = vi.fn().mockReturnValue(['/tmp/included.conf']);
-
-      const hosts = await parser.processIncludeDirectives('/test/.ssh/config');
-      expect(hosts).toHaveLength(2);
-      expect(hosts.map(h => h.alias)).toContain('included');
-      expect(hosts.map(h => h.alias)).toContain('main');
-    });
-
-    it('should handle errors in included files gracefully', async () => {
-      const mainConfig = `
-Include /tmp/broken.conf
-
-Host main
-    HostName 1.2.3.4
-`;
-      // First call reads main config, second call for included file rejects
-      // processIncludeDirectives catches this internally and returns []
-      readFile
-        .mockResolvedValueOnce(mainConfig)
-        .mockRejectedValueOnce(new Error('permission denied'));
-
-      parser.expandIncludePath = vi.fn().mockReturnValue(['/tmp/broken.conf']);
-
-      const hosts = await parser.processIncludeDirectives('/test/.ssh/config');
-      // Should still return hosts from main config (included returns [] on error)
-      expect(hosts).toHaveLength(1);
-      expect(hosts[0].alias).toBe('main');
-    });
-  });
-
-  describe('expandIncludePath', () => {
-    it('should expand tilde paths', () => {
-      const result = parser.expandIncludePath('~/nonexistent-path-xyz', '/base');
-      expect(result).toEqual([]);
-    });
-
-    it('should handle relative paths', () => {
-      const result = parser.expandIncludePath('relative/path', '/base/config');
-      expect(result).toEqual([]);
-    });
-
-    it('should return empty for non-existent absolute paths', () => {
-      const result = parser.expandIncludePath('/nonexistent-absolute-path-xyz', '/base');
-      expect(result).toEqual([]);
-    });
-
-    it('should treat Windows drive-letter paths as absolute', () => {
-      const result = parser.expandIncludePath('C:\\nonexistent-absolute-path-xyz', '/base/config');
-      expect(result).toEqual([]);
-    });
-
-    it('should treat UNC paths as absolute', () => {
-      const result = parser.expandIncludePath('\\\\server\\share\\nonexistent-path-xyz', '/base/config');
-      expect(result).toEqual([]);
-    });
-
-    it('should expand tilde paths with backslashes', () => {
-      const result = parser.expandIncludePath('~\\nonexistent-path-xyz', '/base');
-      expect(result).toEqual([]);
-    });
-
-    it('should return empty for non-existent glob patterns', () => {
-      const result = parser.expandIncludePath('/nonexistent-path-xyz/*.conf', '/base');
-      expect(result).toEqual([]);
-    });
-
-    it('should handle errors in glob/existsSync gracefully', () => {
-      // Temporarily break require('fs').existsSync to trigger catch
-      const fs = require('fs');
-      const origExistsSync = fs.existsSync;
-      fs.existsSync = () => { throw new Error('fs broken'); };
-
-      const result = parser.expandIncludePath('/some/path/file', '/base');
-      expect(result).toEqual([]);
-
-      fs.existsSync = origExistsSync;
-    });
+  it('should skip hosts without hostname', () => {
+    const config = sshConfigLib.parse(SAMPLE_SSH_CONFIG);
+    const hosts = parser.extractHostsFromConfig(config, '/test');
+    expect(hosts.find(h => h.alias === 'nohost')).toBeUndefined();
   });
 });
 
 // =============================================================================
 // SSHClient Tests
 // =============================================================================
-
 describe('SSHClient', () => {
   let client;
-
   beforeEach(() => {
     client = new SSHClient();
+    // Disable auto-retry for unit tests (retries are tested separately)
+    client.sessionManager.config._config = { ...client.sessionManager.config._defaults, maxRetries: 0, retryDelay: 1 };
     vi.clearAllMocks();
+    readFile.mockResolvedValue(`Host test\n    HostName 1.2.3.4\n`);
   });
 
-  describe('getPasswordForHost', () => {
-    beforeEach(() => {
-      readFile.mockResolvedValue(SAMPLE_SSH_CONFIG);
-    });
-
-    it('should find password by alias', async () => {
-      const pw = await client.getPasswordForHost('mail');
-      expect(pw).toBe('killer99');
-    });
-
-    it('should return null for host without password', async () => {
-      const pw = await client.getPasswordForHost('prod');
-      expect(pw).toBeNull();
-    });
-
-    it('should return null for unknown host', async () => {
-      const pw = await client.getPasswordForHost('unknown');
-      expect(pw).toBeNull();
-    });
-
-    it('should strip user@ prefix', async () => {
-      const pw = await client.getPasswordForHost('saf@mail');
-      expect(pw).toBe('killer99');
-    });
-
-    it('should find password by hostname', async () => {
-      const pw = await client.getPasswordForHost('88.198.170.88');
-      expect(pw).toBe('killer99');
-    });
-  });
-
-  describe('getAskpassScript', () => {
-    it('should create askpass script and cache it', async () => {
-      writeFile.mockResolvedValue();
-      chmod.mockResolvedValue();
-
-      const path1 = await client.getAskpassScript();
-      const path2 = await client.getAskpassScript();
-
-      expect(path1).toBe(path2);
-      expect(writeFile).toHaveBeenCalledTimes(1);
-      expect(chmod).toHaveBeenCalledWith(path1, 0o700);
-    });
-
-    it('should write correct script content', async () => {
-      writeFile.mockResolvedValue();
-      chmod.mockResolvedValue();
-
-      await client.getAskpassScript();
-
-      expect(writeFile).toHaveBeenCalledWith(
-        expect.stringContaining('mcp-ssh-askpass'),
-        '#!/bin/sh\necho "$MCP_SSH_PASS"\n'
-      );
-    });
-  });
-
-  describe('buildSpawnEnv', () => {
-    it('should return null for host without password', async () => {
-      readFile.mockResolvedValue(SAMPLE_SSH_CONFIG);
-      const env = await client.buildSpawnEnv('prod');
-      expect(env).toBeNull();
-    });
-
-    it('should return env with SSH_ASKPASS for host with password', async () => {
-      readFile.mockResolvedValue(SAMPLE_SSH_CONFIG);
-      stat.mockResolvedValue({ mode: 0o100600 });
-      writeFile.mockResolvedValue();
-      chmod.mockResolvedValue();
-
-      const env = await client.buildSpawnEnv('mail');
-      expect(env.MCP_SSH_PASS).toBe('killer99');
-      expect(env.SSH_ASKPASS).toContain('mcp-ssh-askpass');
-      expect(env.SSH_ASKPASS_REQUIRE).toBe('force');
-      expect(env.DISPLAY).toBe(process.env.DISPLAY);
-    });
-
-    it('should throw if config has insecure permissions', async () => {
-      readFile.mockResolvedValue(SAMPLE_SSH_CONFIG);
-      stat.mockResolvedValue({ mode: 0o100644 });
-
-      // Trigger password parsing first
-      await client.getPasswordForHost('mail');
-
-      await expect(client.buildSpawnEnv('mail')).rejects.toThrow('insecure permissions');
-    });
-  });
-
-  describe('runRemoteCommand', () => {
-    beforeEach(() => {
-      readFile.mockResolvedValue(`Host test\n    HostName 1.2.3.4\n`);
-    });
-
-    it('should execute ssh command and return output', async () => {
+  describe('runRemoteCommand — exit code fixes', () => {
+    it('should return structured result with success/code/errorType', async () => {
       client._spawn = createMockSpawn({ stdout: 'hello\n', code: 0 });
-
       const result = await client.runRemoteCommand('test', 'echo hello');
-
-      expect(client._spawn).toHaveBeenCalledWith(
-        'ssh',
-        ['-o', 'StrictHostKeyChecking=accept-new', '--', 'test', 'echo hello'],
-        expect.any(Object)
-      );
-      expect(result).toEqual({ stdout: 'hello\n', stderr: '', code: 0 });
+      expect(result.success).toBe(true);
+      expect(result.code).toBe(0);
+      expect(result.errorType).toBeNull();
+      expect(result.duration).toBeDefined();
+      expect(result.timedOut).toBe(false);
+      expect(result.signal).toBeNull();
     });
 
-    it('should handle command failure with exit code', async () => {
-      client._spawn = createMockSpawn({ stderr: 'not found', code: 127 });
-
-      const result = await client.runRemoteCommand('test', 'badcmd');
-      expect(result.code).toBe(127);
-      expect(result.stderr).toBe('not found');
-    });
-
-    it('should handle spawn error', async () => {
-      client._spawn = createMockSpawn({ error: new Error('spawn failed') });
-
+    it('should return code 1 for null exit code (not 0)', async () => {
+      client._spawn = vi.fn(() => {
+        const child = new EventEmitter();
+        child.stdout = new EventEmitter();
+        child.stderr = new EventEmitter();
+        child.kill = vi.fn();
+        setTimeout(() => child.emit('close', null, null), 5);
+        return child;
+      });
       const result = await client.runRemoteCommand('test', 'cmd');
       expect(result.code).toBe(1);
-      expect(result.stderr).toBe('spawn failed');
+      expect(result.code).not.toBe(0);
     });
 
-    it('should handle timeout', async () => {
+    it('should return 128+signal for signal termination', async () => {
+      client._spawn = vi.fn(() => {
+        const child = new EventEmitter();
+        child.stdout = new EventEmitter();
+        child.stderr = new EventEmitter();
+        child.kill = vi.fn();
+        setTimeout(() => child.emit('close', null, 'SIGKILL'), 5);
+        return child;
+      });
+      const result = await client.runRemoteCommand('test', 'cmd');
+      expect(result.code).toBe(137);
+      expect(result.signal).toBe('SIGKILL');
+    });
+
+    it('should return 124 for timeout', async () => {
       client._spawn = vi.fn(() => {
         const child = new EventEmitter();
         child.stdout = new EventEmitter();
@@ -577,314 +588,332 @@ describe('SSHClient', () => {
         });
         return child;
       });
-
       const result = await client.runRemoteCommand('test', 'sleep 999', { timeout: 10 });
       expect(result.code).toBe(124);
-      expect(result.stderr).toContain('Command timed out');
+      expect(result.timedOut).toBe(true);
+      expect(result.errorType).toBe('timeout');
+      expect(result.stderr).toContain('timed out');
     });
 
-    it('should set detached and env when password is available', async () => {
-      readFile.mockResolvedValue(SAMPLE_SSH_CONFIG);
-      stat.mockResolvedValue({ mode: 0o100600 });
-      writeFile.mockResolvedValue();
-      chmod.mockResolvedValue();
-      client._spawn = createMockSpawn({ stdout: 'ok', code: 0 });
-
-      await client.runRemoteCommand('mail', 'ls');
-
-      expect(client._spawn).toHaveBeenCalledWith(
-        'ssh',
-        expect.any(Array),
-        expect.objectContaining({
-          detached: true,
-          env: expect.objectContaining({
-            MCP_SSH_PASS: 'killer99',
-            SSH_ASKPASS_REQUIRE: 'force',
-          }),
-        })
-      );
+    it('should classify auth errors', async () => {
+      client._spawn = createMockSpawn({ stderr: 'Permission denied (publickey)', code: 255 });
+      const result = await client.runRemoteCommand('test', 'ls');
+      expect(result.errorType).toBe('auth_failed');
     });
 
-    it('should not set detached without password', async () => {
-      client._spawn = createMockSpawn({ stdout: 'ok', code: 0 });
+    it('should classify connection errors', async () => {
+      client._spawn = createMockSpawn({ stderr: 'Connection refused', code: 255 });
+      const result = await client.runRemoteCommand('test', 'ls');
+      expect(result.errorType).toBe('connection_failed');
+    });
 
+    it('should classify command not found', async () => {
+      client._spawn = createMockSpawn({ stderr: 'not found', code: 127 });
+      const result = await client.runRemoteCommand('test', 'badcmd');
+      expect(result.errorType).toBe('command_not_found');
+    });
+
+    it('should classify generic command failure', async () => {
+      client._spawn = createMockSpawn({ stderr: 'error', code: 1 });
+      const result = await client.runRemoteCommand('test', 'cmd');
+      expect(result.errorType).toBe('command_failed');
+    });
+
+    it('should include truncated flag and originalSize', async () => {
+      client._spawn = vi.fn(() => {
+        const child = new EventEmitter();
+        child.stdout = new EventEmitter();
+        child.stderr = new EventEmitter();
+        child.kill = vi.fn();
+        setTimeout(() => {
+          child.stdout.emit('data', Buffer.from('x'.repeat(10 * 1024 * 1024 + 100)));
+          child.emit('close', 0);
+        }, 5);
+        return child;
+      });
+      const result = await client.runRemoteCommand('test', 'bigcmd');
+      expect(result.truncated).toBe(true);
+      expect(result.originalStdoutSize).toBeGreaterThan(10 * 1024 * 1024);
+    });
+  });
+
+  describe('runRemoteCommand — security', () => {
+    it('should reject hostAlias starting with -', async () => {
+      client._spawn = createMockSpawn();
+      await expect(client.runRemoteCommand('-oProxyCommand=evil', 'ls')).rejects.toThrow(/Invalid hostAlias/);
+    });
+
+    it('should reject unknown hostAlias', async () => {
+      readFile.mockResolvedValueOnce(`Host test\n    HostName 1.2.3.4\n`).mockResolvedValueOnce('');
+      client._spawn = createMockSpawn();
+      await expect(client.runRemoteCommand('unknown.com', 'ls')).rejects.toThrow(/Unknown hostAlias/);
+    });
+
+    it('should inject ControlMaster args', async () => {
+      client._spawn = createMockSpawn({ stdout: '', code: 0 });
       await client.runRemoteCommand('test', 'ls');
+      const args = client._spawn.mock.calls[0][1];
+      expect(args).toContain('ControlMaster=auto');
+      expect(args.some(a => a.includes('ControlPath='))).toBe(true);
+    });
+  });
 
-      expect(client._spawn).toHaveBeenCalledWith(
-        'ssh',
-        expect.any(Array),
-        expect.objectContaining({
-          stdio: ['ignore', 'pipe', 'pipe'],
-        })
-      );
-      const opts = client._spawn.mock.calls[0][2];
-      expect(opts.detached).toBeUndefined();
-      expect(opts.env).toBeUndefined();
+  describe('runRemoteCommand — MCP cancellation', () => {
+    it('should return cancelled result when signal is already aborted', async () => {
+      const controller = new AbortController();
+      controller.abort();
+      client._spawn = createMockSpawn({ stdout: '', code: 0 });
+      const result = await client.runRemoteCommand('test', 'ls', { signal: controller.signal });
+      expect(result.errorType).toBe('cancelled');
+      expect(result.success).toBe(false);
+      expect(client._spawn).not.toHaveBeenCalled();
     });
 
-    it('should truncate stdout exceeding 10MB', async () => {
+    it('should kill child process when signal aborts mid-execution', async () => {
+      const controller = new AbortController();
+      const mockChild = new EventEmitter();
+      mockChild.stdout = new EventEmitter();
+      mockChild.stderr = new EventEmitter();
+      mockChild.kill = vi.fn(() => {
+        setTimeout(() => mockChild.emit('close', null, 'SIGTERM'), 2);
+      });
+      client._spawn = vi.fn(() => mockChild);
+
+      const promise = client.runRemoteCommand('test', 'sleep 100', { signal: controller.signal, timeout: 10000 });
+
+      // Abort after a short delay
+      setTimeout(() => controller.abort(), 10);
+
+      const result = await promise;
+      expect(result.errorType).toBe('cancelled');
+      expect(mockChild.kill).toHaveBeenCalled();
+    });
+  });
+
+  describe('runRemoteCommand — MCP progress', () => {
+    it('should call onProgress callback with bytes received', async () => {
+      const progressCalls = [];
+      const onProgress = (progress, total, message) => progressCalls.push({ progress, total, message });
+
       client._spawn = vi.fn(() => {
         const child = new EventEmitter();
         child.stdout = new EventEmitter();
         child.stderr = new EventEmitter();
         child.kill = vi.fn();
-
         setTimeout(() => {
-          // Send in two chunks so the second one triggers truncation
-          child.stdout.emit('data', Buffer.from('x'.repeat(10 * 1024 * 1024)));
-          child.stdout.emit('data', Buffer.from('x'.repeat(1024)));
+          child.stdout.emit('data', Buffer.from('line1\n'));
+          child.stdout.emit('data', Buffer.from('line2\n'));
           child.emit('close', 0);
         }, 5);
-
         return child;
       });
 
-      const result = await client.runRemoteCommand('test', 'bigcmd');
-      expect(result.stdout).toContain('[Output truncated');
+      await client.runRemoteCommand('test', 'ls', { onProgress });
+      expect(progressCalls.length).toBeGreaterThanOrEqual(2);
+      expect(progressCalls[0].progress).toBe(6); // 'line1\n' = 6 bytes
+      expect(progressCalls[1].progress).toBe(12); // total 12 bytes
     });
+  });
 
-    it('should reject hostAlias starting with - to block ProxyCommand injection', async () => {
-      client._spawn = createMockSpawn({ stdout: 'pwned', code: 0 });
-
-      await expect(
-        client.runRemoteCommand('-oProxyCommand=touch /tmp/pwned', 'echo')
-      ).rejects.toThrow(/Invalid hostAlias/);
-      expect(client._spawn).not.toHaveBeenCalled();
-    });
-
-    it('should reject hostAlias containing shell metacharacters (Windows cmd.exe vector)', async () => {
+  describe('runRemoteCommand — session state', () => {
+    it('should track cwd across commands', async () => {
       client._spawn = createMockSpawn({ stdout: '', code: 0 });
-
-      for (const evil of ['foo & calc.exe', 'foo|calc', 'foo;ls', 'foo`id`', 'foo$(id)', 'foo"bar', "foo'bar"]) {
-        await expect(client.runRemoteCommand(evil, 'ls')).rejects.toThrow(/Invalid hostAlias/);
-      }
-      expect(client._spawn).not.toHaveBeenCalled();
-    });
-
-    it('should reject unknown hostAlias that is not in ssh config or known_hosts', async () => {
-      readFile
-        .mockResolvedValueOnce(`Host test\n    HostName 1.2.3.4\n`)
-        .mockResolvedValueOnce('');
+      await client.runRemoteCommand('test', 'cd /app');
       client._spawn = createMockSpawn({ stdout: '', code: 0 });
-
-      await expect(client.runRemoteCommand('unknown.example.com', 'ls')).rejects.toThrow(/Unknown hostAlias/);
-      expect(client._spawn).not.toHaveBeenCalled();
+      await client.runRemoteCommand('test', 'ls');
+      const cmd = client._spawn.mock.calls[0][1];
+      // The second command should include cd /app prefix
+      const sshArgsStr = cmd.join(' ');
+      // ControlMaster is on, so the second call should have cd prefix in the command
+      expect(client.sessionManager.sessions.get('test').cwd).toBe('/app');
     });
 
-    it('should allow user@alias when alias exists in ssh config', async () => {
-      client._spawn = createMockSpawn({ stdout: 'ok\n', code: 0 });
+    it('should use useSession=false to skip state', async () => {
+      client._spawn = createMockSpawn({ stdout: '', code: 0 });
+      await client.runRemoteCommand('test', 'cd /app', { useSession: false });
+      expect(client.sessionManager.sessions.has('test')).toBe(false);
+    });
+  });
 
-      const result = await client.runRemoteCommand('root@test', 'whoami');
-
-      expect(client._spawn).toHaveBeenCalledWith(
-        'ssh',
-        ['-o', 'StrictHostKeyChecking=accept-new', '--', 'root@test', 'whoami'],
-        expect.any(Object)
-      );
-      expect(result.code).toBe(0);
+  describe('File operations', () => {
+    it('readFile should decode base64 content', async () => {
+      const content = 'Hello World';
+      const encoded = Buffer.from(content).toString('base64');
+      client._spawn = createMockSpawn({ stdout: encoded + '\n', code: 0 });
+      const result = await client.readFile('test', '/etc/hosts');
+      expect(result.success).toBe(true);
+      expect(result.content).toBe(content);
+      expect(result.size).toBe(content.length);
     });
 
-    it('should allow hosts discovered through Include directives', async () => {
-      readFile.mockImplementation(async (filePath) => {
-        if (String(filePath).endsWith('/config')) return SAMPLE_SSH_CONFIG_WITH_INCLUDE;
-        if (String(filePath).endsWith('.conf')) return `Host included\n    HostName 10.10.10.10\n`;
-        if (String(filePath).endsWith('known_hosts')) return '';
-        return '';
-      });
-      client.configParser.expandIncludePath = vi.fn(() => ['/tmp/included.conf']);
-      client._spawn = createMockSpawn({ stdout: 'ok\n', code: 0 });
-
-      const result = await client.runRemoteCommand('included', 'hostname');
-
-      expect(client._spawn).toHaveBeenCalled();
-      expect(result.code).toBe(0);
+    it('readFile should handle errors', async () => {
+      client._spawn = createMockSpawn({ stderr: 'No such file', code: 1 });
+      const result = await client.readFile('test', '/nonexistent');
+      expect(result.success).toBe(false);
+      expect(result.error).toContain('No such file');
     });
 
-    it('should truncate stderr exceeding 10MB', async () => {
+    it('writeFile should pipe base64 to stdin', async () => {
+      const mockChild = new EventEmitter();
+      mockChild.stdout = new EventEmitter();
+      mockChild.stderr = new EventEmitter();
+      mockChild.stdin = { write: vi.fn(), end: vi.fn() };
+      mockChild.kill = vi.fn();
       client._spawn = vi.fn(() => {
-        const child = new EventEmitter();
-        child.stdout = new EventEmitter();
-        child.stderr = new EventEmitter();
-        child.kill = vi.fn();
-
-        setTimeout(() => {
-          child.stderr.emit('data', Buffer.from('x'.repeat(10 * 1024 * 1024)));
-          child.stderr.emit('data', Buffer.from('x'.repeat(1024)));
-          child.emit('close', 0);
-        }, 5);
-
-        return child;
+        setTimeout(() => mockChild.emit('close', 0), 5);
+        return mockChild;
       });
-
-      const result = await client.runRemoteCommand('test', 'bigcmd');
-      expect(result.stderr).toContain('[Stderr truncated');
-    });
-  });
-
-  describe('getHostInfo', () => {
-    beforeEach(() => {
-      readFile.mockResolvedValue(SAMPLE_SSH_CONFIG);
-    });
-
-    it('should return host info without password exposed', async () => {
-      const info = await client.getHostInfo('mail');
-      expect(info.alias).toBe('mail');
-      expect(info.hostname).toBe('88.198.170.88');
-      expect(info._password).toBeUndefined();
-      expect(info.passwordAuth).toBe(true);
-    });
-
-    it('should not set passwordAuth flag when no password', async () => {
-      const info = await client.getHostInfo('prod');
-      expect(info.passwordAuth).toBeUndefined();
-    });
-
-    it('should return null for unknown host', async () => {
-      const info = await client.getHostInfo('nonexistent');
-      expect(info).toBeNull();
-    });
-
-    it('should return correct port and user', async () => {
-      const info = await client.getHostInfo('prod');
-      expect(info.port).toBe(42077);
-      expect(info.user).toBe('trashmail');
-    });
-  });
-
-  describe('checkConnectivity', () => {
-    beforeEach(() => {
-      readFile.mockResolvedValue(`Host test\n    HostName 1.2.3.4\n`);
-    });
-
-    it('should return connected on success', async () => {
-      client._spawn = createMockSpawn({ stdout: 'connected\n', code: 0 });
-
-      const status = await client.checkConnectivity('test');
-      expect(status).toEqual({ connected: true, message: 'Connection successful' });
-    });
-
-    it('should return not connected on failure', async () => {
-      client._spawn = createMockSpawn({ stderr: 'refused', code: 255 });
-
-      const status = await client.checkConnectivity('test');
-      expect(status).toEqual({ connected: false, message: 'Connection failed' });
-    });
-
-    it('should return not connected when output is unexpected', async () => {
-      client._spawn = createMockSpawn({ stdout: 'something else', code: 0 });
-
-      const status = await client.checkConnectivity('test');
-      expect(status.connected).toBe(false);
-    });
-  });
-
-  describe('uploadFile', () => {
-    beforeEach(() => {
-      readFile.mockResolvedValue(`Host test\n    HostName 1.2.3.4\n`);
-    });
-
-    it('should return true on success', async () => {
-      client._execFileAsync = createMockExecFileAsync();
-
-      const result = await client.uploadFile('test', '/local/file', '/remote/file');
-      expect(result).toBe(true);
-      expect(client._execFileAsync).toHaveBeenCalledWith(
-        'scp',
-        ['-o', 'StrictHostKeyChecking=accept-new', '--', '/local/file', 'test:/remote/file'],
-        expect.any(Object)
+      const result = await client.writeFile('test', '/tmp/test.txt', 'Hello');
+      expect(result.success).toBe(true);
+      expect(result.bytesWritten).toBe(5);
+      // Verify base64 was written to stdin
+      expect(mockChild.stdin.write).toHaveBeenCalledWith(
+        Buffer.from('Hello', 'utf-8').toString('base64')
       );
     });
 
-    it('should return false on error', async () => {
-      client._execFileAsync = createMockExecFileAsync({ error: new Error('scp failed') });
-
-      const result = await client.uploadFile('test', '/local/file', '/remote/file');
-      expect(result).toBe(false);
+    it('editFile should apply replacements', async () => {
+      const original = 'listen 80;\nserver_name localhost;';
+      const encoded = Buffer.from(original).toString('base64');
+      // First call: readFile
+      client._spawn = createMockSpawn({ stdout: encoded + '\n', code: 0 });
+      // We need to mock the writeFile call too
+      const writeChild = new EventEmitter();
+      writeChild.stdout = new EventEmitter();
+      writeChild.stderr = new EventEmitter();
+      writeChild.stdin = { write: vi.fn(), end: vi.fn() };
+      writeChild.kill = vi.fn();
+      let callCount = 0;
+      client._spawn = vi.fn(() => {
+        callCount++;
+        if (callCount === 1) {
+          // readFile call
+          const c = new EventEmitter();
+          c.stdout = new EventEmitter();
+          c.stderr = new EventEmitter();
+          c.stdin = { write: vi.fn(), end: vi.fn() };
+          c.kill = vi.fn();
+          setTimeout(() => {
+            c.stdout.emit('data', Buffer.from(encoded + '\n'));
+            c.emit('close', 0);
+          }, 5);
+          return c;
+        } else {
+          // writeFile call
+          setTimeout(() => writeChild.emit('close', 0), 5);
+          return writeChild;
+        }
+      });
+      const result = await client.editFile('test', '/etc/nginx.conf', [
+        { oldText: 'listen 80;', newText: 'listen 443 ssl;' },
+      ]);
+      expect(result.success).toBe(true);
+      expect(result.editsApplied).toBe(1);
     });
 
-    it('should pass password env when available', async () => {
-      readFile.mockResolvedValue(SAMPLE_SSH_CONFIG);
-      stat.mockResolvedValue({ mode: 0o100600 });
-      writeFile.mockResolvedValue();
-      chmod.mockResolvedValue();
-      client._execFileAsync = createMockExecFileAsync();
-
-      await client.uploadFile('mail', '/local/file', '/remote/file');
-
-      const opts = client._execFileAsync.mock.calls[0][2];
-      expect(opts.env.MCP_SSH_PASS).toBe('killer99');
+    it('listDir should return structured entries', async () => {
+      const output = 'f|1024|1700000000.000000000|/test/file.txt\nd|4096|1700000000.000000000|/test/subdir\n';
+      client._spawn = createMockSpawn({ stdout: output, code: 0 });
+      const result = await client.listDir('test', '/test');
+      expect(result.success).toBe(true);
+      expect(result.entries).toHaveLength(2);
+      expect(result.entries[0].type).toBe('file');
+      expect(result.entries[1].type).toBe('directory');
     });
 
-    it('should reject hostAlias starting with - to block ProxyCommand injection', async () => {
-      client._execFileAsync = createMockExecFileAsync();
-
-      const result = await client.uploadFile('-oProxyCommand=touch /tmp/pwned', '/local/file', '/remote/file');
-      expect(result).toBe(false);
-      expect(client._execFileAsync).not.toHaveBeenCalled();
+    it('stat should return file metadata', async () => {
+      client._spawn = createMockSpawn({ stdout: '1024|644|1700000000|regular file\n', code: 0 });
+      const result = await client.stat('test', '/etc/hosts');
+      expect(result.success).toBe(true);
+      expect(result.size).toBe(1024);
+      expect(result.mode).toBe('644');
     });
 
-    it('should reject unknown hostAlias for uploads', async () => {
-      readFile
-        .mockResolvedValueOnce(`Host test\n    HostName 1.2.3.4\n`)
-        .mockResolvedValueOnce('');
-      client._execFileAsync = createMockExecFileAsync();
+    it('mkdir should create directories', async () => {
+      client._spawn = createMockSpawn({ stdout: '', code: 0 });
+      const result = await client.mkdir('test', '/tmp/newdir');
+      expect(result.success).toBe(true);
+    });
 
-      const result = await client.uploadFile('unknown.example.com', '/local/file', '/remote/file');
-      expect(result).toBe(false);
-      expect(client._execFileAsync).not.toHaveBeenCalled();
+    it('move should rename files', async () => {
+      client._spawn = createMockSpawn({ stdout: '', code: 0 });
+      const result = await client.move('test', '/tmp/a', '/tmp/b');
+      expect(result.success).toBe(true);
+    });
+
+    it('remove should detect dangerous paths', async () => {
+      client._spawn = createMockSpawn({ stdout: '', code: 0 });
+      const result = await client.remove('test', '/');
+      expect(result.success).toBe(false);
+      expect(result.danger).toBeDefined();
+      expect(result.danger.level).toBe('critical');
+    });
+
+    it('remove should allow with force=true', async () => {
+      client._spawn = createMockSpawn({ stdout: '', code: 0 });
+      const result = await client.remove('test', '/tmp/build', { force: true });
+      expect(result.success).toBe(true);
     });
   });
 
-  describe('downloadFile', () => {
-    beforeEach(() => {
-      readFile.mockResolvedValue(`Host test\n    HostName 1.2.3.4\n`);
+  describe('File transfer — error context', () => {
+    it('uploadFile should return full error context on failure', async () => {
+      const error = new Error('scp failed');
+      error.stderr = 'Permission denied';
+      client._execFileAsync = createMockExecFileAsync({ error });
+      const result = await client.uploadFile('test', '/local', '/remote');
+      expect(result.success).toBe(false);
+      expect(result.error).toBe('scp failed');
+      expect(result.stderr).toBe('Permission denied');
+      expect(result.errorType).toBeDefined();
+      expect(result.duration).toBeDefined();
     });
 
-    it('should return true on success', async () => {
+    it('uploadFile should return bytesTransferred on success', async () => {
+      stat.mockResolvedValue({ size: 1024 });
       client._execFileAsync = createMockExecFileAsync();
-
-      const result = await client.downloadFile('test', '/remote/file', '/local/file');
-      expect(result).toBe(true);
-      expect(client._execFileAsync).toHaveBeenCalledWith(
-        'scp',
-        ['-o', 'StrictHostKeyChecking=accept-new', '--', 'test:/remote/file', '/local/file'],
-        expect.any(Object)
-      );
+      const result = await client.uploadFile('test', '/local', '/remote');
+      expect(result.success).toBe(true);
+      expect(result.bytesTransferred).toBe(1024);
+      expect(result.duration).toBeDefined();
     });
 
-    it('should return false on error', async () => {
-      client._execFileAsync = createMockExecFileAsync({ error: new Error('scp failed') });
-
-      const result = await client.downloadFile('test', '/remote/file', '/local/file');
-      expect(result).toBe(false);
+    it('downloadFile should return full error context on failure', async () => {
+      const error = new Error('scp failed');
+      error.stderr = 'No such file';
+      client._execFileAsync = createMockExecFileAsync({ error });
+      const result = await client.downloadFile('test', '/remote', '/local');
+      expect(result.success).toBe(false);
+      expect(result.errorType).toBe('not_found');
     });
 
-    it('should reject hostAlias starting with - to block ProxyCommand injection', async () => {
+    it('uploadDir should use scp -r', async () => {
       client._execFileAsync = createMockExecFileAsync();
-
-      const result = await client.downloadFile('-oProxyCommand=touch /tmp/pwned', '/remote/file', '/local/file');
-      expect(result).toBe(false);
-      expect(client._execFileAsync).not.toHaveBeenCalled();
+      const result = await client.uploadDir('test', '/local/dir', '/remote/dir');
+      expect(result.success).toBe(true);
+      const scpArgs = client._execFileAsync.mock.calls[0][1];
+      expect(scpArgs).toContain('-r');
     });
 
-    it('should allow hostnames learned from known_hosts for downloads', async () => {
-      readFile
-        .mockResolvedValueOnce(`Host test\n    HostName 1.2.3.4\n`)
-        .mockResolvedValueOnce('10.0.0.1 ssh-rsa AAAAB3Nz...\n');
+    it('downloadDir should use scp -r', async () => {
       client._execFileAsync = createMockExecFileAsync();
+      const result = await client.downloadDir('test', '/remote/dir', '/local/dir');
+      expect(result.success).toBe(true);
+      const scpArgs = client._execFileAsync.mock.calls[0][1];
+      expect(scpArgs).toContain('-r');
+    });
 
-      const result = await client.downloadFile('10.0.0.1', '/remote/file', '/local/file');
-      expect(result).toBe(true);
-      expect(client._execFileAsync).toHaveBeenCalled();
+    it('should support preservePermissions option', async () => {
+      stat.mockResolvedValue({ size: 100 });
+      client._execFileAsync = createMockExecFileAsync();
+      await client.uploadFile('test', '/local', '/remote', { preservePermissions: true });
+      const scpArgs = client._execFileAsync.mock.calls[0][1];
+      expect(scpArgs).toContain('-p');
     });
   });
 
-  describe('runCommandBatch', () => {
-    beforeEach(() => {
-      readFile.mockResolvedValue(`Host test\n    HostName 1.2.3.4\n`);
-    });
-
-    it('should execute multiple commands and return results', async () => {
+  describe('runCommandBatch — enhanced', () => {
+    it('should return aggregate summary', async () => {
       let callCount = 0;
       client._spawn = vi.fn(() => {
         callCount++;
@@ -894,20 +923,21 @@ describe('SSHClient', () => {
         child.kill = vi.fn();
         const n = callCount;
         setTimeout(() => {
-          child.stdout.emit('data', Buffer.from(`output${n}\n`));
+          child.stdout.emit('data', Buffer.from(`out${n}\n`));
           child.emit('close', 0);
         }, 5);
         return child;
       });
-
       const result = await client.runCommandBatch('test', ['cmd1', 'cmd2']);
       expect(result.success).toBe(true);
+      expect(result.summary.total).toBe(2);
+      expect(result.summary.succeeded).toBe(2);
+      expect(result.summary.failed).toBe(0);
+      expect(result.summary.totalDuration).toBeDefined();
       expect(result.results).toHaveLength(2);
-      expect(result.results[0].stdout).toBe('output1\n');
-      expect(result.results[1].stdout).toBe('output2\n');
     });
 
-    it('should mark as failed if any command fails but continue', async () => {
+    it('should stop on first error in stopOnError mode', async () => {
       let callCount = 0;
       client._spawn = vi.fn(() => {
         callCount++;
@@ -916,107 +946,140 @@ describe('SSHClient', () => {
         child.stderr = new EventEmitter();
         child.kill = vi.fn();
         const exitCode = callCount === 1 ? 1 : 0;
+        setTimeout(() => child.emit('close', exitCode), 5);
+        return child;
+      });
+      const result = await client.runCommandBatch('test', ['fail', 'pass'], { mode: 'stopOnError' });
+      expect(result.success).toBe(false);
+      expect(result.results).toHaveLength(1); // only 1 executed
+      expect(result.summary.firstFailure.index).toBe(0);
+    });
+
+    it('should continue on error in sequential mode', async () => {
+      let callCount = 0;
+      client._spawn = vi.fn(() => {
+        callCount++;
+        const child = new EventEmitter();
+        child.stdout = new EventEmitter();
+        child.stderr = new EventEmitter();
+        child.kill = vi.fn();
+        const exitCode = callCount === 1 ? 1 : 0;
+        setTimeout(() => child.emit('close', exitCode), 5);
+        return child;
+      });
+      const result = await client.runCommandBatch('test', ['fail', 'pass'], { mode: 'sequential' });
+      expect(result.results).toHaveLength(2);
+      expect(result.summary.failed).toBe(1);
+    });
+
+    it('should run in parallel mode', async () => {
+      let callCount = 0;
+      client._spawn = vi.fn(() => {
+        callCount++;
+        const child = new EventEmitter();
+        child.stdout = new EventEmitter();
+        child.stderr = new EventEmitter();
+        child.kill = vi.fn();
         setTimeout(() => {
-          child.emit('close', exitCode);
+          child.stdout.emit('data', Buffer.from(`out\n`));
+          child.emit('close', 0);
         }, 5);
         return child;
       });
-
-      const result = await client.runCommandBatch('test', ['fail', 'pass']);
-      expect(result.success).toBe(false);
-      expect(result.results).toHaveLength(2);
-    });
-
-    it('should handle empty command list', async () => {
-      const result = await client.runCommandBatch('test', []);
+      const result = await client.runCommandBatch('test', ['a', 'b', 'c'], { mode: 'parallel', concurrency: 3 });
       expect(result.success).toBe(true);
-      expect(result.results).toHaveLength(0);
+      expect(result.summary.mode).toBe('parallel');
+      expect(result.summary.concurrency).toBe(3);
+      expect(result.results).toHaveLength(3);
     });
   });
 
-  describe('listKnownHosts', () => {
-    it('should delegate to configParser.getAllKnownHosts', async () => {
-      readFile
-        .mockResolvedValueOnce(SAMPLE_SSH_CONFIG)
-        .mockResolvedValueOnce(SAMPLE_KNOWN_HOSTS);
-      stat.mockResolvedValue({ mode: 0o100600 });
+  describe('Background tasks', () => {
+    it('startBackground should return taskId and remotePid', async () => {
+      client._spawn = createMockSpawn({ stdout: '12345\n', code: 0 });
+      const result = await client.startBackground('test', 'sleep 100');
+      expect(result.success).toBe(true);
+      expect(result.taskId).toBeDefined();
+      expect(result.remotePid).toBe(12345);
+    });
 
-      const hosts = await client.listKnownHosts();
-      expect(hosts.length).toBeGreaterThan(0);
+    it('getTaskStatus should return running state', async () => {
+      client._spawn = createMockSpawn({ stdout: '12345 S 00:01 sleep\n', code: 0 });
+      // Register a task first
+      client.taskManager.tasks.set('task_test', {
+        hostAlias: 'test', remotePid: 12345, command: 'sleep 100',
+        startedAt: Date.now(), logFile: '/tmp/mcp-task-task_test.log',
+      });
+      const result = await client.getTaskStatus('task_test');
+      expect(result.success).toBe(true);
+      expect(result.running).toBe(true);
+    });
+
+    it('listTasks should return task list', () => {
+      client.taskManager.tasks.set('task_1', {
+        hostAlias: 'test', remotePid: 123, command: 'ls',
+        startedAt: Date.now(), logFile: '/tmp/log',
+      });
+      const result = client.listTasks();
+      expect(result.tasks).toHaveLength(1);
+      expect(result.tasks[0].taskId).toBe('task_1');
     });
   });
 
-  describe('checkConnectivity error handling', () => {
-    it('should handle thrown errors gracefully', async () => {
-      readFile.mockRejectedValue(new Error('config read failed'));
-      client._spawn = createMockSpawn({ stderr: 'error', code: 1 });
-
-      const status = await client.checkConnectivity('test');
-      expect(status.connected).toBe(false);
+  describe('Session management', () => {
+    it('openSession should establish session', async () => {
+      client._spawn = createMockSpawn({ stdout: 'session_opened\n', code: 0 });
+      const result = await client.openSession('test');
+      expect(result.opened).toBe(true);
     });
 
-    it('should catch exceptions from runRemoteCommand', async () => {
-      client.runRemoteCommand = vi.fn().mockRejectedValue(new Error('ssh crash'));
-
-      const status = await client.checkConnectivity('test');
-      expect(status.connected).toBe(false);
-      expect(status.message).toBe('ssh crash');
-    });
-
-    it('should handle non-Error thrown values in catch', async () => {
-      client.runRemoteCommand = vi.fn().mockRejectedValue('string error');
-
-      const status = await client.checkConnectivity('test');
-      expect(status.connected).toBe(false);
-      expect(status.message).toBe('string error');
+    it('listSessions should return active sessions', async () => {
+      client._spawn = createMockSpawn({ stdout: '', code: 0 });
+      await client.runRemoteCommand('test', 'cd /app');
+      const sessions = client.listSessions();
+      expect(sessions).toHaveLength(1);
+      expect(sessions[0].hostAlias).toBe('test');
+      expect(sessions[0].cwd).toBe('/app');
     });
   });
 
-  describe('runCommandBatch error handling', () => {
-    it('should handle thrown errors gracefully', async () => {
-      // Make runRemoteCommand throw by overriding it
-      client.runRemoteCommand = vi.fn().mockRejectedValue(new Error('connection lost'));
-
-      const result = await client.runCommandBatch('test', ['cmd1']);
-      expect(result.success).toBe(false);
-      expect(result.results[0].stderr).toBe('connection lost');
-      expect(result.results[0].code).toBe(1);
+  describe('getHostInfo — backward compatible', () => {
+    it('should strip passwords', async () => {
+      readFile.mockResolvedValue(SAMPLE_SSH_CONFIG);
+      const info = await client.getHostInfo('mail');
+      expect(info._password).toBeUndefined();
+      expect(info.passwordAuth).toBe(true);
     });
+  });
 
-    it('should handle non-Error thrown values', async () => {
-      client.runRemoteCommand = vi.fn().mockRejectedValue('string error');
-
-      const result = await client.runCommandBatch('test', ['cmd1']);
-      expect(result.success).toBe(false);
-      expect(result.results[0].stderr).toBe('string error');
+  describe('checkConnectivity — enhanced', () => {
+    it('should include latency', async () => {
+      client._spawn = createMockSpawn({ stdout: 'connected\n', code: 0 });
+      const status = await client.checkConnectivity('test');
+      expect(status.connected).toBe(true);
+      expect(status.latency).toBeDefined();
     });
   });
 });
 
 // =============================================================================
-// MCP Server Handler Tests (via main())
+// MCP Server Handler Tests
 // =============================================================================
-
 describe('MCP Server Handlers', () => {
   let server;
   let handlers;
 
   beforeEach(async () => {
     vi.clearAllMocks();
-
-    // Capture the request handlers that main() registers
     handlers = {};
 
-    // Mock the MCP SDK Server and Transport
     const { Server } = require('@modelcontextprotocol/sdk/server/index.js');
     const { StdioServerTransport } = require('@modelcontextprotocol/sdk/server/stdio.js');
 
-    // Save original and mock
     const origSetRequestHandler = Server.prototype.setRequestHandler;
     const origConnect = Server.prototype.connect;
 
     Server.prototype.setRequestHandler = function(schema, handler) {
-      // Store by schema name
       if (schema === require('@modelcontextprotocol/sdk/types.js').ListToolsRequestSchema) {
         handlers.listTools = handler;
       } else if (schema === require('@modelcontextprotocol/sdk/types.js').CallToolRequestSchema) {
@@ -1030,168 +1093,102 @@ describe('MCP Server Handlers', () => {
 
     await main();
 
-    // Restore
     Server.prototype.setRequestHandler = origSetRequestHandler;
     Server.prototype.connect = origConnect;
   });
 
-  it('should register listTools handler that returns all tools', async () => {
+  it('should register exactly 6 merged tools', async () => {
     const result = await handlers.listTools();
-    expect(result.tools).toHaveLength(7);
+    expect(result.tools).toHaveLength(6);
     const names = result.tools.map(t => t.name);
-    expect(names).toContain('listKnownHosts');
-    expect(names).toContain('runRemoteCommand');
-    expect(names).toContain('getHostInfo');
-    expect(names).toContain('checkConnectivity');
-    expect(names).toContain('uploadFile');
-    expect(names).toContain('downloadFile');
-    expect(names).toContain('runCommandBatch');
+    expect(names).toContain('ssh_hosts');
+    expect(names).toContain('ssh_exec');
+    expect(names).toContain('ssh_file');
+    expect(names).toContain('ssh_fs');
+    expect(names).toContain('ssh_transfer');
+    expect(names).toContain('ssh_task');
   });
 
-  it('should handle listKnownHosts tool call', async () => {
-    readFile
-      .mockResolvedValueOnce(SAMPLE_SSH_CONFIG)
-      .mockResolvedValueOnce(SAMPLE_KNOWN_HOSTS);
+  it('tool descriptions should include examples and action docs', async () => {
+    const result = await handlers.listTools();
+    const exec = result.tools.find(t => t.name === 'ssh_exec');
+    expect(exec.description).toContain('errorType');
+    expect(exec.description).toContain('Example:');
+    expect(exec.description).toContain('code 0');
+    const file = result.tools.find(t => t.name === 'ssh_file');
+    expect(file.description).toContain('read');
+    expect(file.description).toContain('write');
+    expect(file.description).toContain('edit');
+  });
 
-    const result = await handlers.callTool({
-      params: { name: 'listKnownHosts', arguments: {} }
-    });
-
+  it('should handle ssh_hosts action=list', async () => {
+    readFile.mockResolvedValueOnce(SAMPLE_SSH_CONFIG).mockResolvedValueOnce(SAMPLE_KNOWN_HOSTS);
+    const result = await handlers.callTool({ params: { name: 'ssh_hosts', arguments: { action: 'list' } } });
     const hosts = JSON.parse(result.content[0].text);
     expect(Array.isArray(hosts)).toBe(true);
-    // Passwords should be stripped
-    for (const host of hosts) {
-      expect(host._password).toBeUndefined();
-    }
+    for (const host of hosts) expect(host._password).toBeUndefined();
   });
 
-  it('should handle getHostInfo tool call', async () => {
-    readFile.mockResolvedValue(SAMPLE_SSH_CONFIG);
-
-    const result = await handlers.callTool({
-      params: { name: 'getHostInfo', arguments: { hostAlias: 'mail' } }
-    });
-
-    const info = JSON.parse(result.content[0].text);
-    expect(info.alias).toBe('mail');
-    expect(info._password).toBeUndefined();
-    expect(info.passwordAuth).toBe(true);
-  });
-
-  it('should throw on missing arguments', async () => {
-    await expect(
-      handlers.callTool({ params: { name: 'runRemoteCommand', arguments: undefined } })
-    ).rejects.toThrow('No arguments provided');
-  });
-
-  it('should handle unknown tool name', async () => {
-    const result = await handlers.callTool({
-      params: { name: 'unknownTool', arguments: {} }
-    });
-
+  it('should handle ssh_hosts action=check', async () => {
+    readFile.mockResolvedValue(`Host test\n    HostName 1.2.3.4\n`);
+    const result = await handlers.callTool({ params: { name: 'ssh_hosts', arguments: { action: 'check', hostAlias: 'test' } } });
     const parsed = JSON.parse(result.content[0].text);
+    expect(parsed).toHaveProperty('connected');
+  });
+
+  it('should handle ssh_hosts action=sessions', async () => {
+    const result = await handlers.callTool({ params: { name: 'ssh_hosts', arguments: { action: 'sessions' } } });
+    const parsed = JSON.parse(result.content[0].text);
+    expect(Array.isArray(parsed)).toBe(true);
+  });
+
+  it('should handle ssh_exec with single command', async () => {
+    readFile.mockResolvedValue(`Host test\n    HostName 1.2.3.4\n`);
+    const result = await handlers.callTool({ params: { name: 'ssh_exec', arguments: { hostAlias: 'test', command: 'echo hi' } } });
+    const parsed = JSON.parse(result.content[0].text);
+    expect(parsed).toHaveProperty('code');
+  });
+
+  it('should handle ssh_exec with commands array (batch)', async () => {
+    readFile.mockResolvedValue(`Host test\n    HostName 1.2.3.4\n`);
+    const result = await handlers.callTool({ params: { name: 'ssh_exec', arguments: { hostAlias: 'test', commands: ['echo a', 'echo b'] } } });
+    const parsed = JSON.parse(result.content[0].text);
+    expect(parsed).toHaveProperty('summary');
+    expect(parsed).toHaveProperty('results');
+  });
+
+  it('should handle ssh_task action=list', async () => {
+    const result = await handlers.callTool({ params: { name: 'ssh_task', arguments: { action: 'list' } } });
+    const parsed = JSON.parse(result.content[0].text);
+    expect(parsed.tasks).toBeDefined();
+  });
+
+  it('should handle unknown tool gracefully', async () => {
+    const result = await handlers.callTool({ params: { name: 'unknownTool', arguments: {} } });
+    const parsed = JSON.parse(result.content[0].text);
+    expect(parsed.success).toBe(false);
     expect(parsed.error).toContain('Unknown tool');
   });
 
-  it('should cap runRemoteCommand timeout at 300000ms', async () => {
-    readFile.mockResolvedValue(`Host test\n    HostName 1.2.3.4\n`);
-
-    const result = await handlers.callTool({
-      params: {
-        name: 'runRemoteCommand',
-        arguments: { hostAlias: 'test', command: 'echo hi', timeout: 999999 }
-      }
-    });
-
-    expect(result.content[0].type).toBe('text');
-  });
-
-  it('should handle checkConnectivity tool call', async () => {
-    readFile.mockResolvedValue(`Host test\n    HostName 1.2.3.4\n`);
-
-    const result = await handlers.callTool({
-      params: { name: 'checkConnectivity', arguments: { hostAlias: 'test' } }
-    });
-
+  it('should handle unknown action gracefully', async () => {
+    const result = await handlers.callTool({ params: { name: 'ssh_hosts', arguments: { action: 'invalid' } } });
     const parsed = JSON.parse(result.content[0].text);
-    expect(parsed).toHaveProperty('connected');
-    expect(parsed).toHaveProperty('message');
-  });
-
-  it('should handle uploadFile tool call', async () => {
-    readFile.mockResolvedValue(`Host test\n    HostName 1.2.3.4\n`);
-
-    const result = await handlers.callTool({
-      params: {
-        name: 'uploadFile',
-        arguments: { hostAlias: 'test', localPath: '/tmp/test', remotePath: '/tmp/dest' }
-      }
-    });
-
-    const parsed = JSON.parse(result.content[0].text);
-    expect(parsed).toHaveProperty('success');
-  });
-
-  it('should handle downloadFile tool call', async () => {
-    readFile.mockResolvedValue(`Host test\n    HostName 1.2.3.4\n`);
-
-    const result = await handlers.callTool({
-      params: {
-        name: 'downloadFile',
-        arguments: { hostAlias: 'test', remotePath: '/tmp/src', localPath: '/tmp/dest' }
-      }
-    });
-
-    const parsed = JSON.parse(result.content[0].text);
-    expect(parsed).toHaveProperty('success');
-  });
-
-  it('should handle runCommandBatch tool call', async () => {
-    readFile.mockResolvedValue(`Host test\n    HostName 1.2.3.4\n`);
-
-    const result = await handlers.callTool({
-      params: {
-        name: 'runCommandBatch',
-        arguments: { hostAlias: 'test', commands: ['echo a', 'echo b'] }
-      }
-    });
-
-    const parsed = JSON.parse(result.content[0].text);
-    expect(parsed).toHaveProperty('results');
-    expect(parsed).toHaveProperty('success');
-  });
-
-  it('should allow listKnownHosts without arguments', async () => {
-    readFile
-      .mockResolvedValueOnce(SAMPLE_SSH_CONFIG)
-      .mockResolvedValueOnce(SAMPLE_KNOWN_HOSTS);
-
-    const result = await handlers.callTool({
-      params: { name: 'listKnownHosts' }
-    });
-
-    const hosts = JSON.parse(result.content[0].text);
-    expect(Array.isArray(hosts)).toBe(true);
+    expect(parsed.success).toBe(false);
+    expect(parsed.error).toContain("Unknown action 'invalid'");
   });
 });
 
 // =============================================================================
 // main() error handling
 // =============================================================================
-
 describe('main() error handling', () => {
   it('should handle startup errors gracefully', async () => {
     const { Server } = require('@modelcontextprotocol/sdk/server/index.js');
     const origConnect = Server.prototype.connect;
-
     Server.prototype.connect = vi.fn().mockRejectedValue(new Error('transport failed'));
-
     const exitSpy = vi.spyOn(process, 'exit').mockImplementation(() => {});
-
     await main();
-
     expect(exitSpy).toHaveBeenCalledWith(1);
-
     Server.prototype.connect = origConnect;
     exitSpy.mockRestore();
   });

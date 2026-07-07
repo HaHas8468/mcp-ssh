@@ -77,21 +77,53 @@ This screenshot demonstrates the MCP SSH Agent integrated with Claude, showing h
 - **Automatic Discovery**: Finds hosts from SSH config and known_hosts files
 - **Full SSH Support**: Works with SSH agents, keys, and all authentication methods
 - **Password Authentication**: Supports password-based SSH login and key passphrases via `@password` annotation — passwords never leave your machine
-- **File Operations**: Upload and download files using `scp`
-- **Batch Commands**: Execute multiple commands in sequence
+- **File Operations**: Read, write, edit, list, move, and remove remote files through grouped file tools
+- **Transfers**: Upload and download files or directories using `scp`
+- **Batch Commands**: Execute single commands, batches, or multi-host parallel commands
 - **Error Handling**: Comprehensive error reporting with timeouts
 
-## Functions
+## Tools
 
-The agent provides the following MCP tools:
+The agent exposes 6 action-based MCP tools:
 
-1. **listKnownHosts()** - Lists all known SSH hosts, prioritizing entries from ~/.ssh/config first, then additional hosts from ~/.ssh/known_hosts
-2. **runRemoteCommand(hostAlias, command)** - Executes a command on a remote host using `ssh`
-3. **getHostInfo(hostAlias)** - Returns detailed configuration for a specific host
-4. **checkConnectivity(hostAlias)** - Tests SSH connectivity to a host
-5. **uploadFile(hostAlias, localPath, remotePath)** - Uploads a file to the remote host using `scp`
-6. **downloadFile(hostAlias, remotePath, localPath)** - Downloads a file from the remote host using `scp`
-7. **runCommandBatch(hostAlias, commands)** - Executes multiple commands sequentially
+1. **ssh_hosts** - `list`, `info`, `check`, and `sessions` for host discovery and connection state
+2. **ssh_exec** - Run one command, a command batch, or parallel commands across hosts
+3. **ssh_file** - `read`, `write`, `edit`, and `append` remote file content
+4. **ssh_fs** - `list`, `stat`, `mkdir`, `rm`, and `mv` remote filesystem paths
+5. **ssh_transfer** - `upload` and `download` files or directories via `scp`
+6. **ssh_task** - `start`, `status`, `stop`, and `list` long-running background tasks
+
+### Tool Examples
+
+`ssh_hosts`
+```json
+{ "action": "list" }
+```
+
+`ssh_exec`
+```json
+{ "hostAlias": "prod", "command": "df -h" }
+```
+
+`ssh_file`
+```json
+{ "action": "read", "hostAlias": "prod", "path": "/etc/nginx/nginx.conf" }
+```
+
+`ssh_fs`
+```json
+{ "action": "list", "hostAlias": "prod", "path": "/var/log" }
+```
+
+`ssh_transfer`
+```json
+{ "action": "upload", "hostAlias": "prod", "localPath": "./dist", "remotePath": "/app/dist", "recursive": true }
+```
+
+`ssh_task`
+```json
+{ "action": "start", "hostAlias": "prod", "command": "npm run build" }
+```
 
 ## Configuration Examples
 
@@ -603,7 +635,8 @@ To publish a new DXT release:
 npm run build:dxt
 
 # Create a GitHub release with the DXT file
-gh release create v1.0.3 build/mcp-ssh-1.0.3.dxt --title "Release v1.0.3" --notes "MCP SSH Agent v1.0.3"
+VERSION=$(node -p "require('./package.json').version")
+gh release create "v${VERSION}" "build/mcp-ssh-${VERSION}.dxt" --title "Release v${VERSION}" --notes "MCP SSH Agent v${VERSION}"
 ```
 
 The DXT file will be available as a release asset for users to download and install.
@@ -631,10 +664,9 @@ mcp-ssh/
 ├── start-silent.sh            # Silent startup script
 ├── scripts/
 │   └── build-dxt.sh           # DXT package build script
-├── doc/
-│   ├── example.png            # Usage example screenshot
-│   └── Claude.png             # Claude Desktop integration example
-└── doc/                       # Documentation assets
+└── doc/
+    ├── example.png            # Usage example screenshot
+    └── Claude.png             # Claude Desktop integration example
 ```
 
 ## About
