@@ -22,7 +22,8 @@ vi.mock('fs/promises', async () => {
 import { readFile, stat, writeFile, chmod } from 'fs/promises';
 import {
   SSHConfigParser, SSHClient, SessionManager, TaskManager,
-  AuditLogger, PermissionGuard, McpConfig, RateLimiter, detectDangerousCommand, main
+  AuditLogger, PermissionGuard, McpConfig, RateLimiter,
+  detectDangerousCommand, shQuote, validateFileMode, main
 } from './server.mjs';
 
 function createMockSpawn({ stdout = '', stderr = '', code = 0, error = null } = {}) {
@@ -48,6 +49,31 @@ function createMockExecFileAsync({ error = null } = {}) {
   return vi.fn(async () => {
     if (error) throw error;
     return { stdout: '', stderr: '' };
+  });
+}
+
+function buildBatchOutput(marker, records) {
+  return records.map((record, index) => [
+    `${marker}_STDOUT_${index}=${Buffer.from(record.stdout || '', 'utf-8').toString('base64')}`,
+    `${marker}_STDERR_${index}=${Buffer.from(record.stderr || '', 'utf-8').toString('base64')}`,
+    `${marker}_RC_${index}=${record.code}`,
+  ].join('\n')).join('\n') + '\n';
+}
+
+function mockBatchRun(client, records) {
+  return vi.spyOn(client, 'runRemoteCommand').mockImplementation(async (_hostAlias, command) => {
+    const marker = command.match(/(MCP_BATCH_[A-Za-z0-9_]+)_STDOUT_0=/)[1];
+    return {
+      success: true,
+      code: 0,
+      stdout: buildBatchOutput(marker, records),
+      stderr: '',
+      duration: 12,
+      timedOut: false,
+      truncated: false,
+      originalStdoutSize: 0,
+      originalStderrSize: 0,
+    };
   });
 }
 
@@ -112,8 +138,8 @@ describe('SessionManager', () => {
     session.cwd = '/app';
     session.env.set('NODE_ENV', 'production');
     const cmd = sm.buildCommandWithState('prod', 'npm test');
-    expect(cmd).toContain('cd "/app"');
-    expect(cmd).toContain('export NODE_ENV="production"');
+    expect(cmd).toContain("cd '/app'");
+    expect(cmd).toContain("export NODE_ENV='production'");
     expect(cmd).toContain('npm test');
   });
 
@@ -389,6 +415,7 @@ describe('Keychain integration', () => {
     client = new SSHClient();
     client.sessionManager.config._config = { ...client.sessionManager.config._defaults, maxRetries: 0, retryDelay: 1 };
     vi.clearAllMocks();
+    stat.mockResolvedValue({ mode: 0o100600 });
   });
 
   it('should fall back to @password annotation when keytar is not available', async () => {
@@ -447,6 +474,23 @@ describe('detectDangerousCommand', () => {
     expect(detectDangerousCommand('npm install').detected).toBe(false);
     expect(detectDangerousCommand('git pull').detected).toBe(false);
     expect(detectDangerousCommand('rm -rf /tmp/build').detected).toBe(false);
+  });
+});
+
+// =============================================================================
+// Shell quoting / validation Tests
+// =============================================================================
+describe('shell helpers', () => {
+  it('should single-quote shell values safely', () => {
+    expect(shQuote('/tmp/a b')).toBe("'/tmp/a b'");
+    expect(shQuote("/tmp/it's-here")).toBe("'/tmp/it'\\''s-here'");
+    expect(shQuote('/tmp/$(touch pwned)`x`')).toBe("'/tmp/$(touch pwned)`x`'");
+  });
+
+  it('should validate octal file modes', () => {
+    expect(validateFileMode('644')).toBe('644');
+    expect(validateFileMode('0755')).toBe('0755');
+    expect(() => validateFileMode('644; rm -rf /')).toThrow(/Invalid file mode/);
   });
 });
 
@@ -536,6 +580,37 @@ describe('SSHConfigParser', () => {
     const config = sshConfigLib.parse(SAMPLE_SSH_CONFIG);
     const hosts = parser.extractHostsFromConfig(config, '/test');
     expect(hosts.find(h => h.alias === 'nohost')).toBeUndefined();
+  });
+
+  it('should cache known hosts within the TTL', async () => {
+    stat.mockResolvedValue({ mode: 0o100600 });
+    readFile
+      .mockResolvedValueOnce(SAMPLE_SSH_CONFIG)
+      .mockResolvedValueOnce(SAMPLE_KNOWN_HOSTS);
+
+    const first = await parser.getAllKnownHosts();
+    const second = await parser.getAllKnownHosts();
+
+    expect(first.find(h => h.alias === 'prod')).toBeDefined();
+    expect(second.find(h => h.alias === 'prod')).toBeDefined();
+    expect(readFile).toHaveBeenCalledTimes(2);
+  });
+
+  it('should refresh known hosts after cache invalidation', async () => {
+    stat.mockResolvedValue({ mode: 0o100600 });
+    readFile
+      .mockResolvedValueOnce(`Host first\n    HostName 1.1.1.1\n`)
+      .mockResolvedValueOnce('')
+      .mockResolvedValueOnce(`Host second\n    HostName 2.2.2.2\n`)
+      .mockResolvedValueOnce('');
+
+    const first = await parser.getAllKnownHosts();
+    parser.invalidateCache();
+    const second = await parser.getAllKnownHosts();
+
+    expect(first.find(h => h.alias === 'first')).toBeDefined();
+    expect(second.find(h => h.alias === 'second')).toBeDefined();
+    expect(readFile).toHaveBeenCalledTimes(4);
   });
 });
 
@@ -787,6 +862,21 @@ describe('SSHClient', () => {
       expect(result.error).toContain('No such file');
     });
 
+    it('readFile should reject truncated command output', async () => {
+      vi.spyOn(client, 'runRemoteCommand').mockResolvedValue({
+        code: 0,
+        stdout: 'SGVsbG8=',
+        stderr: '',
+        truncated: true,
+        originalStdoutSize: 10 * 1024 * 1024 + 1,
+        originalStderrSize: 0,
+      });
+      const result = await client.readFile('test', '/large-file');
+      expect(result.success).toBe(false);
+      expect(result.errorType).toBe('output_truncated');
+      expect(result.truncated).toBe(true);
+    });
+
     it('writeFile should pipe base64 to stdin', async () => {
       const mockChild = new EventEmitter();
       mockChild.stdout = new EventEmitter();
@@ -949,41 +1039,26 @@ describe('SSHClient', () => {
 
   describe('runCommandBatch — enhanced', () => {
     it('should return aggregate summary', async () => {
-      let callCount = 0;
-      client._spawn = vi.fn(() => {
-        callCount++;
-        const child = new EventEmitter();
-        child.stdout = new EventEmitter();
-        child.stderr = new EventEmitter();
-        child.kill = vi.fn();
-        const n = callCount;
-        setTimeout(() => {
-          child.stdout.emit('data', Buffer.from(`out${n}\n`));
-          child.emit('close', 0);
-        }, 5);
-        return child;
-      });
+      const runSpy = mockBatchRun(client, [
+        { stdout: 'out1\n', code: 0 },
+        { stdout: 'out2\n', code: 0 },
+      ]);
       const result = await client.runCommandBatch('test', ['cmd1', 'cmd2']);
       expect(result.success).toBe(true);
       expect(result.summary.total).toBe(2);
       expect(result.summary.succeeded).toBe(2);
       expect(result.summary.failed).toBe(0);
       expect(result.summary.totalDuration).toBeDefined();
+      expect(result.summary.singleConnection).toBe(true);
       expect(result.results).toHaveLength(2);
+      expect(result.results[0].stdout).toBe('out1\n');
+      expect(runSpy).toHaveBeenCalledTimes(1);
     });
 
     it('should stop on first error in stopOnError mode', async () => {
-      let callCount = 0;
-      client._spawn = vi.fn(() => {
-        callCount++;
-        const child = new EventEmitter();
-        child.stdout = new EventEmitter();
-        child.stderr = new EventEmitter();
-        child.kill = vi.fn();
-        const exitCode = callCount === 1 ? 1 : 0;
-        setTimeout(() => child.emit('close', exitCode), 5);
-        return child;
-      });
+      mockBatchRun(client, [
+        { stderr: 'failed\n', code: 1 },
+      ]);
       const result = await client.runCommandBatch('test', ['fail', 'pass'], { mode: 'stopOnError' });
       expect(result.success).toBe(false);
       expect(result.results).toHaveLength(1); // only 1 executed
@@ -991,6 +1066,16 @@ describe('SSHClient', () => {
     });
 
     it('should continue on error in sequential mode', async () => {
+      mockBatchRun(client, [
+        { stderr: 'failed\n', code: 1 },
+        { stdout: 'ok\n', code: 0 },
+      ]);
+      const result = await client.runCommandBatch('test', ['fail', 'pass'], { mode: 'sequential' });
+      expect(result.results).toHaveLength(2);
+      expect(result.summary.failed).toBe(1);
+    });
+
+    it('should keep legacy per-command execution when singleConnection=false', async () => {
       let callCount = 0;
       client._spawn = vi.fn(() => {
         callCount++;
@@ -998,13 +1083,15 @@ describe('SSHClient', () => {
         child.stdout = new EventEmitter();
         child.stderr = new EventEmitter();
         child.kill = vi.fn();
-        const exitCode = callCount === 1 ? 1 : 0;
-        setTimeout(() => child.emit('close', exitCode), 5);
+        setTimeout(() => {
+          child.stdout.emit('data', Buffer.from(`legacy${callCount}\n`));
+          child.emit('close', 0);
+        }, 5);
         return child;
       });
-      const result = await client.runCommandBatch('test', ['fail', 'pass'], { mode: 'sequential' });
+      const result = await client.runCommandBatch('test', ['cmd1', 'cmd2'], { singleConnection: false });
       expect(result.results).toHaveLength(2);
-      expect(result.summary.failed).toBe(1);
+      expect(client._spawn).toHaveBeenCalledTimes(2);
     });
 
     it('should run in parallel mode', async () => {
@@ -1052,15 +1139,32 @@ describe('SSHClient', () => {
     });
 
     it('getTaskStatus should return running state', async () => {
-      client._spawn = createMockSpawn({ stdout: '12345 S 00:01 sleep\n', code: 0 });
       // Register a task first
       client.taskManager.tasks.set('task_test', {
         hostAlias: 'test', remotePid: 12345, command: 'sleep 100',
         startedAt: Date.now(), logFile: '/tmp/mcp-task-task_test.log',
       });
+      const runSpy = vi.spyOn(client, 'runRemoteCommand').mockImplementation(async (_hostAlias, command) => {
+        const marker = command.match(/(MCP_TASK_\d+_\d+_[a-z0-9]+)/)[1];
+        return {
+          code: 0,
+          stdout: [
+            `${marker}_PROCESS_START`,
+            '12345 S 00:01 sleep',
+            `${marker}_PROCESS_END`,
+            `${marker}_LOG_START`,
+            'task log',
+            `${marker}_LOG_END`,
+          ].join('\n'),
+          stderr: '',
+          duration: 5,
+        };
+      });
       const result = await client.getTaskStatus('task_test');
       expect(result.success).toBe(true);
       expect(result.running).toBe(true);
+      expect(result.recentLog).toBe('task log');
+      expect(runSpy).toHaveBeenCalledTimes(1);
     });
 
     it('listTasks should return running tasks', async () => {
@@ -1107,6 +1211,7 @@ describe('SSHClient', () => {
   describe('getHostInfo — backward compatible', () => {
     it('should strip passwords', async () => {
       readFile.mockResolvedValue(SAMPLE_SSH_CONFIG);
+      stat.mockResolvedValue({ mode: 0o100600 });
       const info = await client.getHostInfo('mail');
       expect(info._password).toBeUndefined();
       expect(info.passwordAuth).toBe(true);
@@ -1219,6 +1324,20 @@ describe('MCP Server Handlers', () => {
     const result = await handlers.callTool({ params: { name: 'ssh_hosts', arguments: { action: 'sessions' } } });
     const parsed = JSON.parse(result.content[0].text);
     expect(Array.isArray(parsed)).toBe(true);
+  });
+
+  it('should handle ssh_hosts action=warmup', async () => {
+    readFile.mockResolvedValue(`Host test\n    HostName 1.2.3.4\n`);
+    const result = await handlers.callTool({ params: { name: 'ssh_hosts', arguments: { action: 'warmup', hostAlias: 'test', timeout: 100 } } });
+    const parsed = JSON.parse(result.content[0].text);
+    expect(parsed.warmed).toBe(true);
+    expect(parsed.session.hostAlias).toBe('test');
+  });
+
+  it('should handle ssh_hosts action=closeSession', async () => {
+    const result = await handlers.callTool({ params: { name: 'ssh_hosts', arguments: { action: 'closeSession', hostAlias: 'test' } } });
+    const parsed = JSON.parse(result.content[0].text);
+    expect(parsed.closed).toBe(true);
   });
 
   it('should handle ssh_exec with single command', async () => {

@@ -62,6 +62,32 @@ function debugLog(message) {
 const MAX_OUTPUT_SIZE = 10 * 1024 * 1024;
 const DEFAULT_TIMEOUT = 120000;
 const MAX_TIMEOUT = 300000;
+const DEFAULT_SSH_CONFIG_CACHE_TTL = 5000;
+
+function shQuote(value) {
+  return `'${String(value ?? '').replace(/'/g, `'\\''`)}'`;
+}
+
+function validateFileMode(mode) {
+  if (mode === undefined || mode === null || mode === '') return null;
+  const normalized = String(mode);
+  if (!/^[0-7]{3,4}$/.test(normalized)) {
+    throw new Error(`Invalid file mode '${normalized}'. Expected octal permissions like 644 or 0755.`);
+  }
+  return normalized;
+}
+
+function nonNegativeInteger(value, name) {
+  const normalized = Number(value);
+  if (!Number.isSafeInteger(normalized) || normalized < 0) {
+    throw new Error(`${name} must be a non-negative integer`);
+  }
+  return normalized;
+}
+
+function escapeRegExp(value) {
+  return String(value).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
 
 // Signal name → number mapping for exit code computation
 const SIGNAL_NUMBERS = {
@@ -93,6 +119,7 @@ class McpConfig {
       retryDelay: 1000,
       retryBackoffMultiplier: 2,
       maxOutputSize: 10 * 1024 * 1024,
+      sshConfigCacheTtl: DEFAULT_SSH_CONFIG_CACHE_TTL,
     };
   }
 
@@ -336,10 +363,10 @@ class SessionManager {
     if (!session) return command;
     let prefix = '';
     for (const [k, v] of session.env) {
-      prefix += `export ${k}=${JSON.stringify(v)}; `;
+      prefix += `export ${k}=${shQuote(v)}; `;
     }
     if (session.cwd) {
-      prefix += `cd ${JSON.stringify(session.cwd)} && `;
+      prefix += `cd ${shQuote(session.cwd)} && `;
     }
     return prefix + command;
   }
@@ -432,6 +459,24 @@ class SSHConfigParser {
     const homeDir = homedir();
     this.configPath = join(homeDir, '.ssh', 'config');
     this.knownHostsPath = join(homeDir, '.ssh', 'known_hosts');
+    this._allHostsCache = null;
+    this._allHostsCacheAt = 0;
+    this._configsWithPasswords = new Set();
+  }
+
+  invalidateCache() {
+    this._allHostsCache = null;
+    this._allHostsCacheAt = 0;
+    this._configsWithPasswords = new Set();
+  }
+
+  _cloneHosts(hosts) {
+    return hosts.map(host => ({ ...host }));
+  }
+
+  _cacheIsFresh(now = Date.now()) {
+    const ttl = Number(mcpConfig.get('sshConfigCacheTtl') ?? DEFAULT_SSH_CONFIG_CACHE_TTL);
+    return Boolean(this._allHostsCache && ttl > 0 && now - this._allHostsCacheAt < ttl);
   }
 
   async parseConfig() {
@@ -563,7 +608,6 @@ class SSHConfigParser {
     }
 
     if (hasPasswords) {
-      this._configsWithPasswords = this._configsWithPasswords || new Set();
       this._configsWithPasswords.add(configPath);
     }
 
@@ -585,13 +629,17 @@ class SSHConfigParser {
     }
   }
 
-  async getAllKnownHosts() {
+  async getAllKnownHosts(options = {}) {
+    const now = Date.now();
+    if (!options.forceRefresh && this._cacheIsFresh(now)) {
+      return this._cloneHosts(this._allHostsCache);
+    }
+
+    this._configsWithPasswords = new Set();
     const configHosts = await this.processIncludeDirectives(this.configPath);
 
-    if (this._configsWithPasswords) {
-      for (const configPath of this._configsWithPasswords) {
-        await this.checkFilePermissions(configPath);
-      }
+    for (const configPath of this._configsWithPasswords) {
+      await this.checkFilePermissions(configPath);
     }
 
     const knownHostnames = await this.parseKnownHosts();
@@ -604,7 +652,9 @@ class SSHConfigParser {
     }
 
     configHosts.forEach(host => { host.source = 'ssh_config'; });
-    return allHosts;
+    this._allHostsCache = this._cloneHosts(allHosts);
+    this._allHostsCacheAt = now;
+    return this._cloneHosts(allHosts);
   }
 }
 
@@ -709,7 +759,7 @@ class SSHClient {
     }
 
     // Legacy fallback: @password annotation in ~/.ssh/config
-    const hosts = await this.configParser.processIncludeDirectives(this.configParser.configPath);
+    const hosts = await this.configParser.getAllKnownHosts();
     const host = hosts.find(h => h.alias === cleanAlias || h.hostname === cleanAlias);
     return host?._password || null;
   }
@@ -747,10 +797,8 @@ class SSHClient {
     const password = await this.getPasswordForHost(hostAlias);
     if (!password) return null;
 
-    if (this.configParser._configsWithPasswords) {
-      for (const configPath of this.configParser._configsWithPasswords) {
-        await this.configParser.checkFilePermissions(configPath);
-      }
+    for (const configPath of this.configParser._configsWithPasswords) {
+      await this.configParser.checkFilePermissions(configPath);
     }
 
     const askpassScript = await this.getAskpassScript();
@@ -901,7 +949,7 @@ class SSHClient {
           this._spawn(SSH_BIN, [
             ...this.sessionManager.getControlArgs(),
             '-o', 'ConnectTimeout=5',
-            '--', hostAlias, `pkill -f '${marker}' 2>/dev/null; true`,
+            '--', hostAlias, `pkill -f ${shQuote(marker)} 2>/dev/null; true`,
           ], { stdio: 'ignore', windowsHide: true, shell: false });
         } catch {}
       };
@@ -919,7 +967,7 @@ class SSHClient {
           await this._spawn(SSH_BIN, [
             ...this.sessionManager.getControlArgs(),
             '-o', 'ConnectTimeout=5',
-            '--', hostAlias, `pkill -f '${marker}' 2>/dev/null; true`,
+            '--', hostAlias, `pkill -f ${shQuote(marker)} 2>/dev/null; true`,
           ], { stdio: 'ignore', windowsHide: true, shell: false });
         } catch {}
       }, timeout);
@@ -1102,12 +1150,12 @@ class SSHClient {
   // ===========================================================================
   // Session management tools (P0 #11)
   // ===========================================================================
-  async openSession(hostAlias) {
+  async openSession(hostAlias, options = {}) {
     this._assertSafeHostAlias(hostAlias);
     await this._assertKnownHostAlias(hostAlias);
     await this.sessionManager.getSession(hostAlias);
     // Establish the ControlMaster connection with a no-op
-    const result = await this.runRemoteCommand(hostAlias, 'echo session_opened', { useSession: false });
+    const result = await this.runRemoteCommand(hostAlias, 'echo session_opened', { useSession: false, timeout: options.timeout });
     return {
       hostAlias,
       opened: result.success,
@@ -1122,6 +1170,7 @@ class SSHClient {
   }
 
   async closeSession(hostAlias) {
+    this._assertSafeHostAlias(hostAlias);
     // Close the ControlMaster connection
     try {
       await execFileAsync(SSH_BIN, [
@@ -1146,11 +1195,13 @@ class SSHClient {
     await this.permissionGuard.check(hostAlias, 'readFile', { remotePath });
 
     // Use base64 encoding for binary-safe transfer (P1 #32)
-    let cmd = `base64 "${remotePath.replace(/"/g, '\\"')}"`;
+    const quotedPath = shQuote(remotePath);
+    let cmd = `base64 ${quotedPath}`;
     if (options.offset !== undefined || options.limit !== undefined) {
-      const offset = options.offset || 0;
-      const limit = options.limit ? `head -c ${options.limit}` : 'cat';
-      cmd = `tail -c +${offset + 1} "${remotePath.replace(/"/g, '\\"')}" | ${limit} | base64`;
+      const offset = options.offset === undefined ? 0 : nonNegativeInteger(options.offset, 'offset');
+      const limit = options.limit === undefined ? null : nonNegativeInteger(options.limit, 'limit');
+      const limitCmd = limit === null ? 'cat' : `head -c ${limit}`;
+      cmd = `tail -c +${offset + 1} ${quotedPath} | ${limitCmd} | base64`;
     }
 
     const result = await this.runRemoteCommand(hostAlias, cmd, { useSession: false });
@@ -1159,6 +1210,17 @@ class SSHClient {
         success: false,
         error: result.stderr.trim() || `Failed to read file (code ${result.code})`,
         errorType: result.errorType,
+      };
+    }
+    if (result.truncated) {
+      return {
+        success: false,
+        path: remotePath,
+        error: 'Remote file output exceeded the MCP output limit; use ssh_transfer download for large files.',
+        errorType: 'output_truncated',
+        truncated: true,
+        originalStdoutSize: result.originalStdoutSize,
+        originalStderrSize: result.originalStderrSize,
       };
     }
 
@@ -1174,7 +1236,10 @@ class SSHClient {
       path: remotePath,
       content,
       size: content.length,
+      byteLength: Buffer.byteLength(content, 'utf-8'),
       encoding: 'utf-8',
+      truncated: false,
+      originalStdoutSize: result.originalStdoutSize,
     };
   }
 
@@ -1184,7 +1249,8 @@ class SSHClient {
     await this.permissionGuard.check(hostAlias, 'writeFile', { remotePath });
 
     const encoded = Buffer.from(content, 'utf-8').toString('base64');
-    const escapedPath = remotePath.replace(/"/g, '\\"');
+    const quotedPath = shQuote(remotePath);
+    const mode = validateFileMode(options.mode);
 
     // Pipe base64 content via stdin to remote base64 -d
     return new Promise((resolve) => {
@@ -1201,12 +1267,12 @@ class SSHClient {
           if (!isWindows) spawnOptions.detached = true;
         }
 
-        const modeFlag = options.mode ? ` && chmod ${options.mode} "${escapedPath}"` : '';
+        const modeFlag = mode ? ` && chmod ${mode} ${quotedPath}` : '';
         const child = this._spawn(SSH_BIN, [
           ...this.sessionManager.getControlArgs(),
           '-o', `StrictHostKeyChecking=${this.sessionManager.config.get('strictHostKeyChecking')}`,
           '--', hostAlias,
-          `base64 -d > "${escapedPath}"${modeFlag}`,
+          `base64 -d > ${quotedPath}${modeFlag}`,
         ], spawnOptions);
 
         let stderr = '';
@@ -1303,7 +1369,7 @@ class SSHClient {
     await this._assertKnownHostAlias(hostAlias);
 
     const encoded = Buffer.from(content, 'utf-8').toString('base64');
-    const escapedPath = remotePath.replace(/"/g, '\\"');
+    const quotedPath = shQuote(remotePath);
 
     return new Promise((resolve) => {
       const spawnOptions = { stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true, shell: false };
@@ -1316,7 +1382,7 @@ class SSHClient {
           ...this.sessionManager.getControlArgs(),
           '-o', `StrictHostKeyChecking=${this.sessionManager.config.get('strictHostKeyChecking')}`,
           '--', hostAlias,
-          `base64 -d >> "${escapedPath}"`,
+          `base64 -d >> ${quotedPath}`,
         ], spawnOptions);
 
         let stderr = '';
@@ -1338,12 +1404,12 @@ class SSHClient {
     this._assertSafeHostAlias(hostAlias);
     await this._assertKnownHostAlias(hostAlias);
 
-    const escapedPath = (remotePath || '.').replace(/"/g, '\\"');
+    const quotedPath = shQuote(remotePath || '.');
     const detailed = options.detailed !== false;
     // Use find for structured output, or ls for simple
     const cmd = detailed
-      ? `find "${escapedPath}" -mindepth 1 -maxdepth 1 -printf '%y|%s|%T@|%p\\n' 2>/dev/null || ls -1A "${escapedPath}"`
-      : `ls -1A "${escapedPath}"`;
+      ? `find ${quotedPath} -mindepth 1 -maxdepth 1 -printf '%y|%s|%T@|%p\\n' 2>/dev/null || ls -1A ${quotedPath}`
+      : `ls -1A ${quotedPath}`;
 
     const result = await this.runRemoteCommand(hostAlias, cmd);
     if (result.code !== 0) {
@@ -1373,8 +1439,8 @@ class SSHClient {
     this._assertSafeHostAlias(hostAlias);
     await this._assertKnownHostAlias(hostAlias);
 
-    const escapedPath = remotePath.replace(/"/g, '\\"');
-    const cmd = `stat -c '%s|%a|%Y|%F' "${escapedPath}" 2>/dev/null || stat -f '%z|%Lp|%m|%HT' "${escapedPath}"`;
+    const quotedPath = shQuote(remotePath);
+    const cmd = `stat -c '%s|%a|%Y|%F' ${quotedPath} 2>/dev/null || stat -f '%z|%Lp|%m|%HT' ${quotedPath}`;
 
     const result = await this.runRemoteCommand(hostAlias, cmd);
     if (result.code !== 0) {
@@ -1398,8 +1464,8 @@ class SSHClient {
     await this.permissionGuard.check(hostAlias, 'mkdir', { remotePath });
 
     const parents = options.parents !== false ? '-p' : '';
-    const escapedPath = remotePath.replace(/"/g, '\\"');
-    const result = await this.runRemoteCommand(hostAlias, `mkdir ${parents} "${escapedPath}"`);
+    const quotedPath = shQuote(remotePath);
+    const result = await this.runRemoteCommand(hostAlias, `mkdir ${parents} -- ${quotedPath}`);
     return { success: result.code === 0, path: remotePath, error: result.code !== 0 ? result.stderr.trim() : undefined };
   }
 
@@ -1418,9 +1484,9 @@ class SSHClient {
       };
     }
 
-    const escapedPath = remotePath.replace(/"/g, '\\"');
+    const quotedPath = shQuote(remotePath);
     const recursive = options.recursive !== false ? '-rf' : '-f';
-    const result = await this.runRemoteCommand(hostAlias, `rm ${recursive} "${escapedPath}"`);
+    const result = await this.runRemoteCommand(hostAlias, `rm ${recursive} -- ${quotedPath}`);
     this.auditLogger.log({ tool: 'remove', hostAlias, remotePath, code: result.code });
     return { success: result.code === 0, path: remotePath, error: result.code !== 0 ? result.stderr.trim() : undefined };
   }
@@ -1429,9 +1495,9 @@ class SSHClient {
     this._assertSafeHostAlias(hostAlias);
     await this._assertKnownHostAlias(hostAlias);
 
-    const escapedSrc = srcPath.replace(/"/g, '\\"');
-    const escapedDest = destPath.replace(/"/g, '\\"');
-    const result = await this.runRemoteCommand(hostAlias, `mv "${escapedSrc}" "${escapedDest}"`);
+    const quotedSrc = shQuote(srcPath);
+    const quotedDest = shQuote(destPath);
+    const result = await this.runRemoteCommand(hostAlias, `mv -- ${quotedSrc} ${quotedDest}`);
     return { success: result.code === 0, srcPath, destPath, error: result.code !== 0 ? result.stderr.trim() : undefined };
   }
 
@@ -1638,6 +1704,16 @@ class SSHClient {
       return this._runBatchParallel(hostAlias, commands, options, startTime);
     }
 
+    if (options.singleConnection === false) {
+      return this._runBatchSequentialLegacy(hostAlias, commands, options, startTime);
+    }
+
+    return this._runBatchSingleConnection(hostAlias, commands, options, startTime);
+  }
+
+  async _runBatchSequentialLegacy(hostAlias, commands, options, startTime) {
+    const mode = options.mode || 'sequential';
+
     // sequential or stopOnError
     const results = [];
     let success = true;
@@ -1671,6 +1747,133 @@ class SSHClient {
       results,
       success,
     };
+  }
+
+  _buildBatchScript(marker, commands, mode) {
+    const lines = [
+      'set +e',
+      `__mcp_mode=${shQuote(mode)}`,
+    ];
+
+    commands.forEach((command, index) => {
+      const stdoutPrefix = `${marker}_STDOUT_${index}=`;
+      const stderrPrefix = `${marker}_STDERR_${index}=`;
+      const rcPrefix = `${marker}_RC_${index}=`;
+      lines.push(`__mcp_stdout=$(mktemp "\${TMPDIR:-/tmp}/mcp-ssh-batch.XXXXXX") || exit 1`);
+      lines.push(`__mcp_stderr=$(mktemp "\${TMPDIR:-/tmp}/mcp-ssh-batch.XXXXXX") || { rm -f "$__mcp_stdout"; exit 1; }`);
+      lines.push(`set +e`);
+      lines.push(`eval ${shQuote(command)} >"$__mcp_stdout" 2>"$__mcp_stderr"`);
+      lines.push(`__mcp_rc=$?`);
+      lines.push(`printf '%s' ${shQuote(stdoutPrefix)}; base64 < "$__mcp_stdout" | tr -d '\\n'; printf '\\n'`);
+      lines.push(`printf '%s' ${shQuote(stderrPrefix)}; base64 < "$__mcp_stderr" | tr -d '\\n'; printf '\\n'`);
+      lines.push(`printf '%s%s\\n' ${shQuote(rcPrefix)} "$__mcp_rc"`);
+      lines.push(`rm -f "$__mcp_stdout" "$__mcp_stderr"`);
+      if (mode === 'stopOnError') {
+        lines.push(`if [ "$__mcp_rc" -ne 0 ]; then exit 0; fi`);
+      }
+    });
+
+    return lines.join('\n');
+  }
+
+  _readMarkerValue(output, marker) {
+    const match = output.match(new RegExp(`^${escapeRegExp(marker)}(.*)$`, 'm'));
+    return match ? match[1] : null;
+  }
+
+  _decodeBatchField(value) {
+    if (value === null || value === undefined || value === '') return '';
+    return Buffer.from(value, 'base64').toString('utf-8');
+  }
+
+  _batchSummary(total, results, startTime, extra = {}) {
+    const failedResults = results.filter(r => r.code !== 0);
+    const firstFailureResult = failedResults[0] || null;
+    return {
+      summary: {
+        total,
+        executed: results.length,
+        succeeded: results.filter(r => r.code === 0).length,
+        failed: failedResults.length,
+        firstFailure: firstFailureResult
+          ? { index: firstFailureResult.index, command: firstFailureResult.command, errorType: firstFailureResult.errorType, code: firstFailureResult.code }
+          : null,
+        totalDuration: Date.now() - startTime,
+        ...extra,
+      },
+      results,
+      success: failedResults.length === 0,
+    };
+  }
+
+  async _runBatchSingleConnection(hostAlias, commands, options, startTime) {
+    if (commands.length === 0) {
+      return this._batchSummary(0, [], startTime, { singleConnection: true });
+    }
+
+    const mode = options.mode || 'sequential';
+    const marker = `MCP_BATCH_${process.pid}_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+    const script = this._buildBatchScript(marker, commands, mode);
+    const result = await this.runRemoteCommand(hostAlias, `bash -c ${shQuote(script)}`, {
+      timeout: options.timeout,
+      useSession: options.useSession,
+      confirmed: options.confirmed,
+      force: options.force,
+      signal: options.signal,
+      onProgress: options.onProgress,
+    });
+
+    if (result.confirmationRequired) {
+      const confirmationResult = {
+        index: 0,
+        command: commands[0],
+        success: false,
+        code: 1,
+        stdout: '',
+        stderr: result.message,
+        errorType: 'confirmation_required',
+        confirmationRequired: true,
+        danger: result.danger,
+      };
+      return this._batchSummary(commands.length, [confirmationResult], startTime, { singleConnection: true });
+    }
+
+    const results = [];
+    for (let i = 0; i < commands.length; i++) {
+      const codeValue = this._readMarkerValue(result.stdout, `${marker}_RC_${i}=`);
+      if (codeValue === null) break;
+      const stdout = this._decodeBatchField(this._readMarkerValue(result.stdout, `${marker}_STDOUT_${i}=`));
+      const stderr = this._decodeBatchField(this._readMarkerValue(result.stdout, `${marker}_STDERR_${i}=`));
+      const code = Number.parseInt(codeValue, 10);
+      const errorType = this._classifyError(code, stderr, null, false);
+      results.push({
+        index: i,
+        command: commands[i],
+        success: code === 0,
+        code,
+        signal: null,
+        errorType,
+        stdout,
+        stderr,
+        duration: result.duration,
+        timedOut: false,
+        truncated: result.truncated,
+        contentType: this._detectContentType(stdout),
+      });
+      if (options.useSession !== false) {
+        this.sessionManager.updateStateFromCommand(hostAlias, commands[i], code);
+      }
+    }
+
+    if (results.length === 0) {
+      return this._batchSummary(commands.length, [{
+        index: 0,
+        command: commands[0],
+        ...result,
+      }], startTime, { singleConnection: true, parseFailed: true });
+    }
+
+    return this._batchSummary(commands.length, results, startTime, { singleConnection: true });
   }
 
   async _runBatchParallel(hostAlias, commands, options, startTime) {
@@ -1759,7 +1962,7 @@ class SSHClient {
     const taskId = this.taskManager.generateTaskId();
     const logFile = `/tmp/mcp-task-${taskId}.log`;
     // Start with nohup, capture PID
-    const wrapped = `nohup bash -c ${JSON.stringify(command)} > ${logFile} 2>&1 & echo $!`;
+    const wrapped = `nohup bash -c ${shQuote(command)} > ${shQuote(logFile)} 2>&1 & echo $!`;
 
     const timeout = options.timeout ?? this.config.get('defaultTimeout') ?? 120000;
     const result = await this.runRemoteCommand(hostAlias, wrapped, { useSession: false, timeout });
@@ -1788,24 +1991,47 @@ class SSHClient {
       return { success: false, error: `Task ${taskId} not found` };
     }
 
-    const checkCmd = `ps -p ${task.remotePid} -o pid,stat,etime,comm --no-headers 2>/dev/null || echo "EXITED"`;
-    const checkResult = await this.runRemoteCommand(task.hostAlias, checkCmd, { useSession: false, timeout: 10000 });
+    const remotePid = nonNegativeInteger(task.remotePid, 'remotePid');
+    const marker = `MCP_TASK_${process.pid}_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+    const processStart = `${marker}_PROCESS_START`;
+    const processEnd = `${marker}_PROCESS_END`;
+    const logStart = `${marker}_LOG_START`;
+    const logEnd = `${marker}_LOG_END`;
+    const statusCmd = [
+      `printf '%s\\n' ${shQuote(processStart)}`,
+      `ps -p ${remotePid} -o pid,stat,etime,comm --no-headers 2>/dev/null || echo "EXITED"`,
+      `printf '%s\\n' ${shQuote(processEnd)}`,
+      `printf '%s\\n' ${shQuote(logStart)}`,
+      `tail -50 ${shQuote(task.logFile)} 2>/dev/null || echo "(no log yet)"`,
+      `printf '%s\\n' ${shQuote(logEnd)}`,
+    ].join('; ');
+    const statusResult = await this.runRemoteCommand(task.hostAlias, statusCmd, { useSession: false, timeout: 10000 });
 
-    const logCmd = `tail -50 ${task.logFile} 2>/dev/null || echo "(no log yet)"`;
-    const logResult = await this.runRemoteCommand(task.hostAlias, logCmd, { useSession: false, timeout: 10000 });
+    if (statusResult.code !== 0) {
+      return { success: false, error: statusResult.stderr.trim(), errorType: statusResult.errorType };
+    }
 
-    const running = !checkResult.stdout.includes('EXITED');
+    const processText = this._extractMarkedBlock(statusResult.stdout, processStart, processEnd).trim();
+    const recentLog = this._extractMarkedBlock(statusResult.stdout, logStart, logEnd);
+    const running = !processText.includes('EXITED');
 
     return {
       success: true,
       taskId,
       running,
-      process: checkResult.stdout.trim(),
-      recentLog: logResult.stdout,
+      process: processText,
+      recentLog,
       command: task.command,
       hostAlias: task.hostAlias,
       startedAt: new Date(task.startedAt).toISOString(),
     };
+  }
+
+  _extractMarkedBlock(text, startMarker, endMarker) {
+    const start = text.indexOf(startMarker);
+    const end = text.indexOf(endMarker);
+    if (start < 0 || end < 0 || end < start) return '';
+    return text.slice(start + startMarker.length, end).replace(/^\r?\n/, '').replace(/\r?\n$/, '');
   }
 
   async listTasks(options = {}) {
@@ -1813,7 +2039,8 @@ class SSHClient {
     const tasks = [];
 
     for (const [taskId, task] of this.taskManager.entries()) {
-      const checkCmd = `ps -p ${task.remotePid} -o pid,stat,etime,comm --no-headers 2>/dev/null || echo "EXITED"`;
+      const remotePid = nonNegativeInteger(task.remotePid, 'remotePid');
+      const checkCmd = `ps -p ${remotePid} -o pid,stat,etime,comm --no-headers 2>/dev/null || echo "EXITED"`;
       try {
         const checkResult = await this.runRemoteCommand(task.hostAlias, checkCmd, { useSession: false, timeout: statusTimeout });
         const running = !checkResult.stdout.includes('EXITED');
@@ -1851,7 +2078,8 @@ class SSHClient {
       return { success: false, error: `Task ${taskId} not found` };
     }
 
-    const result = await this.runRemoteCommand(task.hostAlias, `kill ${task.remotePid} 2>/dev/null; echo done`, { useSession: false });
+    const remotePid = nonNegativeInteger(task.remotePid, 'remotePid');
+    const result = await this.runRemoteCommand(task.hostAlias, `kill ${remotePid} 2>/dev/null; echo done`, { useSession: false });
     this.taskManager.remove(taskId);
     this.auditLogger.log({ tool: 'stopTask', taskId, remotePid: task.remotePid });
 
@@ -1862,7 +2090,7 @@ class SSHClient {
   // Existing tools (enhanced)
   // ===========================================================================
   async getHostInfo(hostAlias) {
-    const hosts = await this.configParser.processIncludeDirectives(this.configParser.configPath);
+    const hosts = await this.configParser.getAllKnownHosts();
     const host = hosts.find(host => host.alias === hostAlias || host.hostname === hostAlias) || null;
     if (host) {
       const { _password, ...safeHost } = host;
@@ -1904,15 +2132,18 @@ Actions:
 - "info": Get detailed config for a specific host (hostname, user, port, key). Passwords never exposed.
 - "check": Test SSH connectivity to a host, returns {connected, latency, errorType}
 - "sessions": List active SSH sessions with their cwd and env state
+- "warmup": Pre-open and warm the SSH session/ControlMaster connection for a host
+- "closeSession": Close the SSH ControlMaster/session state for a host
 
 Example: ssh_hosts({ action: "list" })
-Example: ssh_hosts({ action: "check", hostAlias: "prod" })`,
+Example: ssh_hosts({ action: "check", hostAlias: "prod" })
+Example: ssh_hosts({ action: "warmup", hostAlias: "prod" })`,
       inputSchema: {
         type: "object",
         properties: {
-          action: { type: "string", enum: ["list", "info", "check", "sessions"], description: "Action to perform", default: "list" },
-          hostAlias: { type: "string", description: "Host alias (required for 'info' and 'check')" },
-          timeout: { type: "number", description: "Connectivity check timeout ms (default: 15000, max: 300000)", default: 15000 },
+          action: { type: "string", enum: ["list", "info", "check", "sessions", "warmup", "closeSession"], description: "Action to perform", default: "list" },
+          hostAlias: { type: "string", description: "Host alias (required for 'info', 'check', 'warmup', and 'closeSession')" },
+          timeout: { type: "number", description: "Connectivity/warmup timeout ms (default: 15000, max: 300000)", default: 15000 },
         },
         required: ["action"],
       },
@@ -1948,6 +2179,7 @@ Example:
           combineOutput: { type: "boolean", description: "Interleave stdout+stderr by timestamp", default: false },
           confirmed: { type: "boolean", description: "Confirm dangerous operation", default: false },
           useSession: { type: "boolean", description: "Use session state (default: true)", default: true },
+          singleConnection: { type: "boolean", description: "Run sequential/stopOnError command batches over one SSH connection (default: true)", default: true },
         },
       },
     },
@@ -2090,6 +2322,7 @@ async function main() {
       const configDir = join(homedir(), '.ssh');
       watch(configDir, (eventType, filename) => {
         if (filename && (filename === 'config' || filename === 'known_hosts')) {
+          sshClient.configParser.invalidateCache();
           debugLog(`SSH config changed: ${filename}, notifying clients...\n`);
           try {
             server.notification({ method: "notifications/tools/list_changed" });
@@ -2168,7 +2401,7 @@ async function main() {
 
         switch (name) {
           // ===================================================================
-          // ssh_hosts — list | info | check | sessions
+          // ssh_hosts — list | info | check | sessions | warmup | closeSession
           // ===================================================================
           case "ssh_hosts": {
             if (action === 'list' || !action) {
@@ -2183,8 +2416,19 @@ async function main() {
               result = await sshClient.checkConnectivity(args.hostAlias, { timeout: args.timeout });
             } else if (action === 'sessions') {
               result = sshClient.listSessions();
+            } else if (action === 'warmup') {
+              const startedAt = Date.now();
+              const opened = await sshClient.openSession(args.hostAlias, { timeout: args.timeout });
+              result = {
+                hostAlias: args.hostAlias,
+                warmed: Boolean(opened.opened),
+                latency: Date.now() - startedAt,
+                session: opened,
+              };
+            } else if (action === 'closeSession') {
+              result = await sshClient.closeSession(args.hostAlias);
             } else {
-              throw new Error(`Unknown action '${action}' for ssh_hosts. Use: list, info, check, sessions`);
+              throw new Error(`Unknown action '${action}' for ssh_hosts. Use: list, info, check, sessions, warmup, closeSession`);
             }
             break;
           }
@@ -2201,6 +2445,11 @@ async function main() {
               result = await sshClient.runCommandBatch(args.hostAlias, args.commands, {
                 mode: args.mode || 'sequential', timeout: args.timeout,
                 concurrency: args.concurrency,
+                singleConnection: args.singleConnection,
+                confirmed: args.confirmed,
+                useSession: args.useSession,
+                signal: abortSignal,
+                onProgress,
               });
             } else if (args.command) {
               // Single command
@@ -2339,4 +2588,8 @@ async function main() {
   }
 }
 
-export { SSHConfigParser, SSHClient, SessionManager, TaskManager, AuditLogger, PermissionGuard, McpConfig, RateLimiter, detectDangerousCommand, debugLog, main };
+export {
+  SSHConfigParser, SSHClient, SessionManager, TaskManager,
+  AuditLogger, PermissionGuard, McpConfig, RateLimiter,
+  detectDangerousCommand, shQuote, validateFileMode, debugLog, main,
+};
