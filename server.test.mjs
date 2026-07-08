@@ -79,6 +79,20 @@ describe('SessionManager', () => {
   it('should generate ControlMaster args', () => {
     const sm = new SessionManager();
     const args = sm.getControlArgs();
+    if (process.platform === 'win32') {
+      expect(args).toEqual([]);
+    } else {
+      expect(args).toContain('ControlMaster=auto');
+      expect(args).toContain('ControlPersist=300');
+      expect(args.some(a => a.includes('ControlPath='))).toBe(true);
+    }
+  });
+
+  it('should generate ControlMaster args when explicitly enabled', () => {
+    const config = new McpConfig();
+    config._config = { ...config._defaults, controlMaster: true };
+    const sm = new SessionManager(config);
+    const args = sm.getControlArgs();
     expect(args).toContain('ControlMaster=auto');
     expect(args).toContain('ControlPersist=300');
     expect(args.some(a => a.includes('ControlPath='))).toBe(true);
@@ -613,6 +627,25 @@ describe('SSHClient', () => {
       expect(result.errorType).toBe('command_not_found');
     });
 
+    it('should classify marker-derived command exit code', async () => {
+      client._spawn = vi.fn((bin, args) => {
+        const child = new EventEmitter();
+        child.stdout = new EventEmitter();
+        child.stderr = new EventEmitter();
+        child.kill = vi.fn();
+        const wrappedCommand = args.at(-1);
+        const marker = wrappedCommand.match(/echo (MCP_[^;]+)START;/)[1];
+        setTimeout(() => {
+          child.stdout.emit('data', Buffer.from(`${marker}START\n${marker}_RC=127\n`));
+          child.emit('close', 0);
+        }, 5);
+        return child;
+      });
+      const result = await client.runRemoteCommand('test', 'badcmd');
+      expect(result.code).toBe(127);
+      expect(result.errorType).toBe('command_not_found');
+    });
+
     it('should classify generic command failure', async () => {
       client._spawn = createMockSpawn({ stderr: 'error', code: 1 });
       const result = await client.runRemoteCommand('test', 'cmd');
@@ -650,6 +683,7 @@ describe('SSHClient', () => {
     });
 
     it('should inject ControlMaster args', async () => {
+      client.sessionManager.config._config = { ...client.sessionManager.config._defaults, controlMaster: true };
       client._spawn = createMockSpawn({ stdout: '', code: 0 });
       await client.runRemoteCommand('test', 'ls');
       const args = client._spawn.mock.calls[0][1];
@@ -819,6 +853,7 @@ describe('SSHClient', () => {
       expect(result.entries).toHaveLength(2);
       expect(result.entries[0].type).toBe('file');
       expect(result.entries[1].type).toBe('directory');
+      expect(client._spawn.mock.calls[0][1].at(-1)).toContain('-mindepth 1 -maxdepth 1');
     });
 
     it('stat should return file metadata', async () => {
@@ -1001,6 +1036,19 @@ describe('SSHClient', () => {
       expect(result.success).toBe(true);
       expect(result.taskId).toBeDefined();
       expect(result.remotePid).toBe(12345);
+      expect(client.taskManager.get(result.taskId)).toMatchObject({
+        hostAlias: 'test',
+        remotePid: 12345,
+        command: 'sleep 100',
+        logFile: result.logFile,
+      });
+    });
+
+    it('startBackground should pass through startup timeout', async () => {
+      const runSpy = vi.spyOn(client, 'runRemoteCommand').mockResolvedValue({ code: 0, stdout: '12345\n', stderr: '' });
+      const result = await client.startBackground('test', 'sleep 100', { timeout: 45678 });
+      expect(result.success).toBe(true);
+      expect(runSpy).toHaveBeenCalledWith('test', expect.any(String), { useSession: false, timeout: 45678 });
     });
 
     it('getTaskStatus should return running state', async () => {
@@ -1015,14 +1063,27 @@ describe('SSHClient', () => {
       expect(result.running).toBe(true);
     });
 
-    it('listTasks should return task list', () => {
+    it('listTasks should return running tasks', async () => {
       client.taskManager.tasks.set('task_1', {
         hostAlias: 'test', remotePid: 123, command: 'ls',
         startedAt: Date.now(), logFile: '/tmp/log',
       });
-      const result = client.listTasks();
+      client._spawn = createMockSpawn({ stdout: '123 S 00:01 sleep\n', code: 0 });
+      const result = await client.listTasks();
       expect(result.tasks).toHaveLength(1);
       expect(result.tasks[0].taskId).toBe('task_1');
+      expect(result.tasks[0].running).toBe(true);
+    });
+
+    it('listTasks should prune exited tasks', async () => {
+      client.taskManager.tasks.set('task_done', {
+        hostAlias: 'test', remotePid: 123, command: 'sleep 1',
+        startedAt: Date.now(), logFile: '/tmp/log',
+      });
+      client._spawn = createMockSpawn({ stdout: 'EXITED\n', code: 0 });
+      const result = await client.listTasks();
+      expect(result.tasks).toHaveLength(0);
+      expect(client.taskManager.get('task_done')).toBeNull();
     });
   });
 
@@ -1059,6 +1120,15 @@ describe('SSHClient', () => {
       expect(status.connected).toBe(true);
       expect(status.latency).toBeDefined();
     });
+
+    it('should pass through custom timeout', async () => {
+      const runSpy = vi.spyOn(client, 'runRemoteCommand').mockResolvedValue({
+        code: 0, stdout: 'connected\n', stderr: '', duration: 123,
+      });
+      const status = await client.checkConnectivity('test', { timeout: 60000 });
+      expect(status.connected).toBe(true);
+      expect(runSpy).toHaveBeenCalledWith('test', 'echo connected', { useSession: false, timeout: 60000 });
+    });
   });
 });
 
@@ -1068,6 +1138,7 @@ describe('SSHClient', () => {
 describe('MCP Server Handlers', () => {
   let server;
   let handlers;
+  let origSpawn;
 
   beforeEach(async () => {
     vi.clearAllMocks();
@@ -1078,6 +1149,7 @@ describe('MCP Server Handlers', () => {
 
     const origSetRequestHandler = Server.prototype.setRequestHandler;
     const origConnect = Server.prototype.connect;
+    origSpawn = SSHClient.prototype._spawn;
 
     Server.prototype.setRequestHandler = function(schema, handler) {
       if (schema === require('@modelcontextprotocol/sdk/types.js').ListToolsRequestSchema) {
@@ -1087,6 +1159,7 @@ describe('MCP Server Handlers', () => {
       }
     };
     Server.prototype.connect = vi.fn().mockResolvedValue();
+    SSHClient.prototype._spawn = createMockSpawn({ stdout: 'connected\n', code: 0 });
 
     readFile.mockResolvedValue(SAMPLE_SSH_CONFIG);
     stat.mockResolvedValue({ mode: 0o100600 });
@@ -1095,6 +1168,10 @@ describe('MCP Server Handlers', () => {
 
     Server.prototype.setRequestHandler = origSetRequestHandler;
     Server.prototype.connect = origConnect;
+  });
+
+  afterEach(() => {
+    SSHClient.prototype._spawn = origSpawn;
   });
 
   it('should register exactly 6 merged tools', async () => {
@@ -1119,6 +1196,8 @@ describe('MCP Server Handlers', () => {
     expect(file.description).toContain('read');
     expect(file.description).toContain('write');
     expect(file.description).toContain('edit');
+    const hosts = result.tools.find(t => t.name === 'ssh_hosts');
+    expect(hosts.inputSchema.properties.timeout).toBeDefined();
   });
 
   it('should handle ssh_hosts action=list', async () => {
@@ -1131,7 +1210,7 @@ describe('MCP Server Handlers', () => {
 
   it('should handle ssh_hosts action=check', async () => {
     readFile.mockResolvedValue(`Host test\n    HostName 1.2.3.4\n`);
-    const result = await handlers.callTool({ params: { name: 'ssh_hosts', arguments: { action: 'check', hostAlias: 'test' } } });
+    const result = await handlers.callTool({ params: { name: 'ssh_hosts', arguments: { action: 'check', hostAlias: 'test', timeout: 100 } } });
     const parsed = JSON.parse(result.content[0].text);
     expect(parsed).toHaveProperty('connected');
   });
@@ -1144,14 +1223,14 @@ describe('MCP Server Handlers', () => {
 
   it('should handle ssh_exec with single command', async () => {
     readFile.mockResolvedValue(`Host test\n    HostName 1.2.3.4\n`);
-    const result = await handlers.callTool({ params: { name: 'ssh_exec', arguments: { hostAlias: 'test', command: 'echo hi' } } });
+    const result = await handlers.callTool({ params: { name: 'ssh_exec', arguments: { hostAlias: 'test', command: 'echo hi', timeout: 100 } } });
     const parsed = JSON.parse(result.content[0].text);
     expect(parsed).toHaveProperty('code');
   });
 
   it('should handle ssh_exec with commands array (batch)', async () => {
     readFile.mockResolvedValue(`Host test\n    HostName 1.2.3.4\n`);
-    const result = await handlers.callTool({ params: { name: 'ssh_exec', arguments: { hostAlias: 'test', commands: ['echo a', 'echo b'] } } });
+    const result = await handlers.callTool({ params: { name: 'ssh_exec', arguments: { hostAlias: 'test', commands: ['echo a', 'echo b'], timeout: 100 } } });
     const parsed = JSON.parse(result.content[0].text);
     expect(parsed).toHaveProperty('summary');
     expect(parsed).toHaveProperty('results');

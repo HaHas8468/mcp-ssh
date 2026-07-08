@@ -85,6 +85,7 @@ class McpConfig {
     this._defaults = {
       controlPersist: 300,
       controlPath: null, // null = auto-generate
+      controlMaster: !isWindows,
       strictHostKeyChecking: 'accept-new',
       defaultTimeout: 120000,
       maxTimeout: 300000,
@@ -238,6 +239,7 @@ class SessionManager {
   }
 
   getControlArgs() {
+    if (!this.config.get('controlMaster')) return [];
     return [
       '-o', 'ControlMaster=auto',
       '-o', `ControlPath=${this.controlPath}`,
@@ -386,14 +388,15 @@ class TaskManager {
     return `task_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
   }
 
-  register(hostAlias, remotePid, command) {
-    const taskId = this.generateTaskId();
+  register(hostAlias, remotePid, command, options = {}) {
+    const taskId = options.taskId || this.generateTaskId();
+    const logFile = options.logFile || `/tmp/mcp-task-${taskId}.log`;
     this.tasks.set(taskId, {
       hostAlias,
       remotePid,
       command,
       startedAt: Date.now(),
-      logFile: `/tmp/mcp-task-${taskId}.log`,
+      logFile,
     });
     return taskId;
   }
@@ -404,6 +407,10 @@ class TaskManager {
 
   remove(taskId) {
     this.tasks.delete(taskId);
+  }
+
+  entries() {
+    return Array.from(this.tasks.entries());
   }
 
   list() {
@@ -571,7 +578,9 @@ class SSHConfigParser {
         return parts.split(',')[0];
       });
     } catch (error) {
-      debugLog(`Error reading known_hosts file: ${error.message}\n`);
+      if (error.code !== 'ENOENT') {
+        debugLog(`Error reading known_hosts file: ${error.message}\n`);
+      }
       return [];
     }
   }
@@ -642,7 +651,7 @@ class SSHClient {
     this.rateLimiter = new RateLimiter();
     this._keytar = null; // lazy-loaded keytar module
     this._askpassScript = null;
-    this._spawn = spawn;
+    this._spawn = this._spawn || spawn;
     this._execFileAsync = execFileAsync;
     // Load config asynchronously
     this.config.load().catch(e => debugLog(`Config load failed: ${e.message}\n`));
@@ -971,10 +980,6 @@ class SSHClient {
           exitCode = 1; // null without signal = unknown failure, NOT 0
         }
 
-        // Error classification (P1 #21)
-        const errorType = cancelled ? 'cancelled'
-          : this._classifyError(exitCode, stderr, sig, timedOut);
-
         // Extract real exit code from marker if present (command was wrapped)
         if (!timedOut && stdout.includes(`${marker}_RC=`)) {
           const rcMatch = stdout.match(new RegExp(`${marker}_RC=(\\d+)`));
@@ -986,6 +991,10 @@ class SSHClient {
                          .replace(new RegExp(`${marker}_RC=\\d+\\s*\n?`), '');
         }
         stdout = stdout.replace(new RegExp(`${marker}START\\s*\n?`), '');
+
+        // Error classification must use the marker-derived command exit code.
+        const errorType = cancelled ? 'cancelled'
+          : this._classifyError(exitCode, stderr, sig, timedOut);
 
         // Update session state (P0 #2)
         if (useSession) {
@@ -1333,7 +1342,7 @@ class SSHClient {
     const detailed = options.detailed !== false;
     // Use find for structured output, or ls for simple
     const cmd = detailed
-      ? `find "${escapedPath}" -maxdepth 1 -printf '%y|%s|%T@|%p\\n' 2>/dev/null || ls -1A "${escapedPath}"`
+      ? `find "${escapedPath}" -mindepth 1 -maxdepth 1 -printf '%y|%s|%T@|%p\\n' 2>/dev/null || ls -1A "${escapedPath}"`
       : `ls -1A "${escapedPath}"`;
 
     const result = await this.runRemoteCommand(hostAlias, cmd);
@@ -1752,13 +1761,14 @@ class SSHClient {
     // Start with nohup, capture PID
     const wrapped = `nohup bash -c ${JSON.stringify(command)} > ${logFile} 2>&1 & echo $!`;
 
-    const result = await this.runRemoteCommand(hostAlias, wrapped, { useSession: false, timeout: 10000 });
+    const timeout = options.timeout ?? this.config.get('defaultTimeout') ?? 120000;
+    const result = await this.runRemoteCommand(hostAlias, wrapped, { useSession: false, timeout });
     if (result.code !== 0) {
       return { success: false, error: result.stderr.trim(), errorType: result.errorType };
     }
 
     const remotePid = parseInt(result.stdout.trim(), 10);
-    this.taskManager.register(hostAlias, remotePid, command);
+    this.taskManager.register(hostAlias, remotePid, command, { taskId, logFile });
 
     this.auditLogger.log({ tool: 'startBackground', hostAlias, command, taskId, remotePid });
 
@@ -1798,6 +1808,43 @@ class SSHClient {
     };
   }
 
+  async listTasks(options = {}) {
+    const statusTimeout = options.statusTimeout || 10000;
+    const tasks = [];
+
+    for (const [taskId, task] of this.taskManager.entries()) {
+      const checkCmd = `ps -p ${task.remotePid} -o pid,stat,etime,comm --no-headers 2>/dev/null || echo "EXITED"`;
+      try {
+        const checkResult = await this.runRemoteCommand(task.hostAlias, checkCmd, { useSession: false, timeout: statusTimeout });
+        const running = !checkResult.stdout.includes('EXITED');
+        if (!running) {
+          this.taskManager.remove(taskId);
+          continue;
+        }
+        tasks.push({
+          taskId,
+          hostAlias: task.hostAlias,
+          command: task.command,
+          startedAt: new Date(task.startedAt).toISOString(),
+          remotePid: task.remotePid,
+          running,
+        });
+      } catch (error) {
+        tasks.push({
+          taskId,
+          hostAlias: task.hostAlias,
+          command: task.command,
+          startedAt: new Date(task.startedAt).toISOString(),
+          remotePid: task.remotePid,
+          running: null,
+          statusError: error instanceof Error ? error.message : String(error),
+        });
+      }
+    }
+
+    return { tasks };
+  }
+
   async stopTask(taskId) {
     const task = this.taskManager.get(taskId);
     if (!task) {
@@ -1809,10 +1856,6 @@ class SSHClient {
     this.auditLogger.log({ tool: 'stopTask', taskId, remotePid: task.remotePid });
 
     return { success: true, taskId, stopped: true };
-  }
-
-  listTasks() {
-    return { tasks: this.taskManager.list() };
   }
 
   // ===========================================================================
@@ -1829,9 +1872,10 @@ class SSHClient {
     return null;
   }
 
-  async checkConnectivity(hostAlias) {
+  async checkConnectivity(hostAlias, options = {}) {
     try {
-      const result = await this.runRemoteCommand(hostAlias, 'echo connected', { useSession: false, timeout: 15000 });
+      const timeout = options.timeout ?? 15000;
+      const result = await this.runRemoteCommand(hostAlias, 'echo connected', { useSession: false, timeout });
       const connected = result.code === 0 && result.stdout.trim() === 'connected';
       return {
         connected,
@@ -1868,6 +1912,7 @@ Example: ssh_hosts({ action: "check", hostAlias: "prod" })`,
         properties: {
           action: { type: "string", enum: ["list", "info", "check", "sessions"], description: "Action to perform", default: "list" },
           hostAlias: { type: "string", description: "Host alias (required for 'info' and 'check')" },
+          timeout: { type: "number", description: "Connectivity check timeout ms (default: 15000, max: 300000)", default: 15000 },
         },
         required: ["action"],
       },
@@ -2015,6 +2060,7 @@ Examples:
           hostAlias: { type: "string", description: "Target host (for start action)" },
           command: { type: "string", description: "Command to run in background (for start action)" },
           taskId: { type: "string", description: "Task ID (for status/stop actions)" },
+          timeout: { type: "number", description: "Startup timeout ms for background command (default: 120000, max: 300000)", default: 120000 },
         },
         required: ["action"],
       },
@@ -2134,7 +2180,7 @@ async function main() {
             } else if (action === 'info') {
               result = await sshClient.getHostInfo(args.hostAlias);
             } else if (action === 'check') {
-              result = await sshClient.checkConnectivity(args.hostAlias);
+              result = await sshClient.checkConnectivity(args.hostAlias, { timeout: args.timeout });
             } else if (action === 'sessions') {
               result = sshClient.listSessions();
             } else {
@@ -2231,13 +2277,13 @@ async function main() {
           // ===================================================================
           case "ssh_task": {
             if (action === 'start') {
-              result = await sshClient.startBackground(args.hostAlias, args.command);
+              result = await sshClient.startBackground(args.hostAlias, args.command, { timeout: args.timeout });
             } else if (action === 'status') {
               result = await sshClient.getTaskStatus(args.taskId);
             } else if (action === 'stop') {
               result = await sshClient.stopTask(args.taskId);
             } else if (action === 'list' || !action) {
-              result = sshClient.listTasks();
+              result = await sshClient.listTasks();
             } else {
               throw new Error(`Unknown action '${action}' for ssh_task. Use: start, status, stop, list`);
             }

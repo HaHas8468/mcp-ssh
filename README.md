@@ -1,6 +1,6 @@
 # MCP SSH Agent
 
-[![Tests](https://github.com/AiondaDotCom/mcp-ssh/actions/workflows/test.yml/badge.svg)](https://github.com/AiondaDotCom/mcp-ssh/actions/workflows/test.yml)
+[![Tests](https://github.com/HaHas8468/mcp-ssh/actions/workflows/test.yml/badge.svg)](https://github.com/HaHas8468/mcp-ssh/actions/workflows/test.yml)
 
 A Model Context Protocol (MCP) server for managing and controlling SSH connections. This server integrates seamlessly with Claude Desktop and other MCP-compatible clients to provide AI-powered SSH operations.
 
@@ -14,7 +14,7 @@ This MCP server provides SSH operations through a clean, standardized interface 
 
 The easiest way to install MCP SSH Agent is through the Desktop Extension (.dxt) format:
 
-1. Download the latest `mcp-ssh-*.dxt` file from the [GitHub releases page](https://github.com/aiondadotcom/mcp-ssh/releases)
+1. Download the latest `mcp-ssh-*.dxt` file from the [GitHub releases page](https://github.com/HaHas8468/mcp-ssh/releases)
 2. Double-click the `.dxt` file to install it in Claude Desktop
 3. The SSH tools will be automatically available in your conversations with Claude
 
@@ -23,7 +23,7 @@ The easiest way to install MCP SSH Agent is through the Desktop Extension (.dxt)
 #### Installation via npx
 
 ```bash
-npx @aiondadotcom/mcp-ssh
+npx @hahalololos/mcp-ssh
 ```
 
 #### Manual Claude Desktop Configuration
@@ -38,7 +38,7 @@ To use this MCP server with Claude Desktop using manual configuration, add the f
   "mcpServers": {
     "mcp-ssh": {
       "command": "npx",
-      "args": ["@aiondadotcom/mcp-ssh"]
+      "args": ["@hahalololos/mcp-ssh"]
     }
   }
 }
@@ -48,12 +48,12 @@ After adding this configuration, restart Claude Desktop. The SSH tools will be a
 
 #### Global Installation
 ```bash
-npm install -g @aiondadotcom/mcp-ssh
+npm install -g @hahalololos/mcp-ssh
 ```
 
 #### Local Development
 ```bash
-git clone https://github.com/aiondadotcom/mcp-ssh.git
+git clone https://github.com/HaHas8468/mcp-ssh.git
 cd mcp-ssh
 npm install
 npm start
@@ -136,7 +136,7 @@ Here's how your Claude Desktop configuration should look:
   "mcpServers": {
     "mcp-ssh": {
       "command": "npx",
-      "args": ["@aiondadotcom/mcp-ssh"]
+      "args": ["@hahalololos/mcp-ssh"]
     }
   }
 }
@@ -151,7 +151,7 @@ If you prefer to run the server manually or integrate it with other MCP clients:
   "servers": {
     "mcp-ssh": {
       "command": "npx",
-      "args": ["@aiondadotcom/mcp-ssh"]
+      "args": ["@hahalololos/mcp-ssh"]
     }
   }
 }
@@ -181,7 +181,7 @@ The agent runs as a Model Context Protocol server over STDIO. When installed via
 
 ```bash
 # Run via npx (recommended)
-npx @aiondadotcom/mcp-ssh
+npx @hahalololos/mcp-ssh
 
 # Or if installed globally
 mcp-ssh
@@ -408,7 +408,7 @@ Run with debug output to see detailed operation logs:
 
 ```bash
 # Enable debug mode
-MCP_SILENT=false npx @aiondadotcom/mcp-ssh
+MCP_SILENT=false npx @hahalololos/mcp-ssh
 ```
 
 ## SSH Key Setup Guide

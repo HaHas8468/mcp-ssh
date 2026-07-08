@@ -1,6 +1,6 @@
 # Publishing Instructions
 
-This document contains instructions for publishing the @aiondadotcom/mcp-ssh package to npm.
+This document contains instructions for publishing the @hahalololos/mcp-ssh package to npm.
 
 ## Prerequisites
 
@@ -46,7 +46,7 @@ npm install -g ./aiondadotcom-mcp-ssh-*.tgz
 mcp-ssh
 
 # Clean up
-npm uninstall -g @aiondadotcom/mcp-ssh
+npm uninstall -g @hahalololos/mcp-ssh
 rm *.tgz
 ```
 
@@ -79,7 +79,7 @@ npm publish --access public
 ## Package Configuration
 
 The package is configured with:
-- Scoped name: `@aiondadotcom/mcp-ssh`
+- Scoped name: `@hahalololos/mcp-ssh`
 - Public access
 - Binary: `mcp-ssh` command
 - Entry point: `server.mjs`

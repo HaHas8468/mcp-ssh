@@ -113,7 +113,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Automatic SSH host discovery from ~/.ssh/config and ~/.ssh/known_hosts
 - Functions: listKnownHosts, runRemoteCommand, getHostInfo, checkConnectivity, uploadFile, downloadFile, runCommandBatch
 - Claude Desktop integration support
-- NPM package distribution via @aiondadotcom/mcp-ssh
+- NPM package distribution via @hahalololos/mcp-ssh
 - npx compatibility for easy installation and usage
 
 ### Features
