@@ -237,6 +237,33 @@ describe('SessionManager', () => {
     await expect(sm.retryWithBackoff(fn, 'prod', { maxRetries: 2, retryDelay: 1, retryBackoffMultiplier: 1 })).rejects.toThrow('Connection refused');
     expect(attempts).toBe(3); // 1 initial + 2 retries
   });
+
+  it('should reset stale ControlMaster before retrying ssh transport errors', async () => {
+    const sm = new SessionManager();
+    const resetSpy = vi.spyOn(sm, 'resetControlMaster').mockResolvedValue({
+      attempted: true,
+      ok: true,
+      reason: 'local_control_connection',
+    });
+    let attempts = 0;
+    const fn = async () => {
+      attempts++;
+      if (attempts === 1) {
+        const err = new Error('mux_client_request_session: read from master failed');
+        err.errorType = 'ssh_error';
+        err.sshError = { category: 'local_control_connection', retryable: true };
+        err.retryable = true;
+        throw err;
+      }
+      return { success: true };
+    };
+
+    const result = await sm.retryWithBackoff(fn, 'prod', { maxRetries: 1, retryDelay: 1, retryBackoffMultiplier: 1 });
+    expect(result.success).toBe(true);
+    expect(result.retried).toBe(true);
+    expect(result.recoveryActions[0].action).toBe('reset_control_master');
+    expect(resetSpy).toHaveBeenCalledWith('prod', 'local_control_connection');
+  });
 });
 
 // =============================================================================
@@ -668,13 +695,23 @@ describe('SSHClient', () => {
     });
 
     it('should return 124 for timeout', async () => {
+      let spawnCount = 0;
       client._spawn = vi.fn(() => {
+        spawnCount++;
         const child = new EventEmitter();
         child.stdout = new EventEmitter();
         child.stderr = new EventEmitter();
-        child.kill = vi.fn(() => {
-          setTimeout(() => child.emit('close', null), 2);
-        });
+        if (spawnCount === 1) {
+          child.kill = vi.fn(() => {
+            setTimeout(() => child.emit('close', null), 2);
+          });
+        } else {
+          child.kill = vi.fn();
+          setTimeout(() => {
+            child.stdout.emit('data', Buffer.from('MATCHED 12345\nAFTER_TERM \nREMAINING \n'));
+            child.emit('close', 0);
+          }, 2);
+        }
         return child;
       });
       const result = await client.runRemoteCommand('test', 'sleep 999', { timeout: 10 });
@@ -682,6 +719,12 @@ describe('SSHClient', () => {
       expect(result.timedOut).toBe(true);
       expect(result.errorType).toBe('timeout');
       expect(result.stderr).toContain('timed out');
+      expect(result.remoteState.cleanup.terminated).toBe(true);
+      expect(result.remoteState.cleanup.matchedPids).toEqual([12345]);
+      expect(client._spawn).toHaveBeenCalledTimes(2);
+      const cleanupCommand = client._spawn.mock.calls[1][1].at(-1);
+      expect(cleanupCommand).toMatch(/pgrep -f "\$__mcp_pattern"/);
+      expect(cleanupCommand).toMatch(/__mcp_pattern='\[M\]CP_/);
     });
 
     it('should classify auth errors', async () => {
@@ -694,6 +737,14 @@ describe('SSHClient', () => {
       client._spawn = createMockSpawn({ stderr: 'Connection refused', code: 255 });
       const result = await client.runRemoteCommand('test', 'ls');
       expect(result.errorType).toBe('connection_failed');
+      expect(result.sshError.category).toBe('target_unreachable');
+    });
+
+    it('should classify key-exchange closure separately from target unreachable', async () => {
+      client._spawn = createMockSpawn({ stderr: 'kex_exchange_identification: Connection closed by remote host', code: 255 });
+      const result = await client.runRemoteCommand('test', 'ls');
+      expect(result.errorType).toBe('ssh_error');
+      expect(result.sshError.category).toBe('remote_exchange_closed');
     });
 
     it('should classify command not found', async () => {
@@ -709,7 +760,7 @@ describe('SSHClient', () => {
         child.stderr = new EventEmitter();
         child.kill = vi.fn();
         const wrappedCommand = args.at(-1);
-        const marker = wrappedCommand.match(/echo (MCP_[^;]+)START;/)[1];
+        const marker = wrappedCommand.match(/printf '%s\\n' '(MCP_[^']+)START'/)[1];
         setTimeout(() => {
           child.stdout.emit('data', Buffer.from(`${marker}START\n${marker}_RC=127\n`));
           child.emit('close', 0);
@@ -719,6 +770,29 @@ describe('SSHClient', () => {
       const result = await client.runRemoteCommand('test', 'badcmd');
       expect(result.code).toBe(127);
       expect(result.errorType).toBe('command_not_found');
+    });
+
+    it('should keep exit marker on a new line after here-doc commands', async () => {
+      client._spawn = vi.fn((_bin, args) => {
+        const child = new EventEmitter();
+        child.stdout = new EventEmitter();
+        child.stderr = new EventEmitter();
+        child.kill = vi.fn();
+        const wrappedCommand = args.at(-1);
+        expect(wrappedCommand).toContain("cat <<'PY'\nprint('ok')\nPY\n__mcp_ssh_rc=$?");
+        expect(wrappedCommand).not.toContain("PY; echo");
+        const marker = wrappedCommand.match(/printf '%s\\n' '(MCP_[^']+)START'/)[1];
+        setTimeout(() => {
+          child.stdout.emit('data', Buffer.from(`${marker}START\nok\n${marker}_RC=0\n`));
+          child.emit('close', 0);
+        }, 5);
+        return child;
+      });
+
+      const script = "cat <<'PY'\nprint('ok')\nPY";
+      const result = await client.runRemoteCommand('test', script);
+      expect(result.success).toBe(true);
+      expect(result.stdout).toBe('ok\n');
     });
 
     it('should classify generic command failure', async () => {
@@ -841,6 +915,15 @@ describe('SSHClient', () => {
       client._spawn = createMockSpawn({ stdout: '', code: 0 });
       await client.runRemoteCommand('test', 'cd /app', { useSession: false });
       expect(client.sessionManager.sessions.has('test')).toBe(false);
+    });
+
+    it('should return session context delta when requested', async () => {
+      client._spawn = createMockSpawn({ stdout: '', code: 0 });
+      const result = await client.runRemoteCommand('test', 'cd /srv && export FOO=bar', { showSessionContext: true });
+      expect(result.sessionContext.useSession).toBe(true);
+      expect(result.sessionContext.delta.cwdChanged).toBe(true);
+      expect(result.sessionContext.delta.cwdAfter).toBe('/srv');
+      expect(result.sessionContext.delta.envAdded.FOO).toBe('bar');
     });
   });
 
@@ -1123,9 +1206,11 @@ describe('SSHClient', () => {
       expect(result.success).toBe(true);
       expect(result.taskId).toBeDefined();
       expect(result.remotePid).toBe(12345);
+      expect(result.processGroupId).toBe(12345);
       expect(client.taskManager.get(result.taskId)).toMatchObject({
         hostAlias: 'test',
         remotePid: 12345,
+        processGroupId: 12345,
         command: 'sleep 100',
         logFile: result.logFile,
       });
@@ -1146,11 +1231,13 @@ describe('SSHClient', () => {
       });
       const runSpy = vi.spyOn(client, 'runRemoteCommand').mockImplementation(async (_hostAlias, command) => {
         const marker = command.match(/(MCP_TASK_\d+_\d+_[a-z0-9]+)/)[1];
+        expect(command).toContain('tail -n 200');
         return {
           code: 0,
           stdout: [
             `${marker}_PROCESS_START`,
-            '12345 S 00:01 sleep',
+            '12345 1 12345 S 00:01 sleep',
+            'GROUP 12345 sleep 100',
             `${marker}_PROCESS_END`,
             `${marker}_LOG_START`,
             'task log',
@@ -1160,11 +1247,69 @@ describe('SSHClient', () => {
           duration: 5,
         };
       });
-      const result = await client.getTaskStatus('task_test');
+      const result = await client.getTaskStatus('task_test', { logLines: 200 });
       expect(result.success).toBe(true);
       expect(result.running).toBe(true);
       expect(result.recentLog).toBe('task log');
+      expect(result.processGroupId).toBe(12345);
       expect(runSpy).toHaveBeenCalledTimes(1);
+    });
+
+    it('getTaskStatus should return structured health, filtered logs, and readiness', async () => {
+      client.taskManager.tasks.set('task_health', {
+        hostAlias: 'test', remotePid: 12345, processGroupId: 12345, command: 'vllm serve model',
+        startedAt: Date.now(), logFile: '/tmp/mcp-task-task_health.log', exitFile: '/tmp/mcp-task-task_health.exit',
+      });
+      vi.spyOn(client, 'runRemoteCommand').mockImplementation(async (_hostAlias, command) => {
+        const marker = command.match(/(MCP_TASK_\d+_\d+_[a-z0-9]+)/)[1];
+        expect(command).toContain('grep -E --');
+        expect(command).toContain('grep -Ev --');
+        expect(command).toContain('tail -c 4096');
+        expect(command).toContain('awk -v max=120');
+        return {
+          code: 0,
+          stdout: [
+            `${marker}_PROCESS_START`,
+            '12345 1 12345 S 00:01 python',
+            `${marker}_PROCESS_END`,
+            `${marker}_TREE_START`,
+            '12345|1|12345|S|00:01|12.5|3.5|204800|python|python -m vllm.entrypoints.openai.api_server',
+            `${marker}_TREE_END`,
+            `${marker}_PORT_START`,
+            'LISTEN 0 4096 0.0.0.0:8000 0.0.0.0:* users:(("python",pid=12345,fd=42))',
+            `${marker}_PORT_END`,
+            `${marker}_EXIT_START`,
+            'exitCode=',
+            `${marker}_EXIT_END`,
+            `${marker}_LOG_META_START`,
+            'size=100',
+            'start=0',
+            'end=100',
+            'onlyNew=false',
+            `${marker}_LOG_META_END`,
+            `${marker}_LOG_START`,
+            'OpenAI API server ready',
+            `${marker}_LOG_END`,
+          ].join('\n'),
+          stderr: '',
+          duration: 5,
+        };
+      });
+
+      const result = await client.getTaskStatus('task_health', {
+        grep: 'ready',
+        exclude: 'tqdm',
+        tailBytes: 4096,
+        maxLogLineLength: 120,
+        readyPattern: 'ready',
+        ports: [8000],
+      });
+      expect(result.success).toBe(true);
+      expect(result.health.ready).toBe(true);
+      expect(result.processTree[0].pid).toBe(12345);
+      expect(result.resources.rssKb).toBe(204800);
+      expect(result.portsListening[0].port).toBe(8000);
+      expect(result.log.tailBytes).toBe(4096);
     });
 
     it('listTasks should return running tasks', async () => {
@@ -1177,6 +1322,7 @@ describe('SSHClient', () => {
       expect(result.tasks).toHaveLength(1);
       expect(result.tasks[0].taskId).toBe('task_1');
       expect(result.tasks[0].running).toBe(true);
+      expect(result.tasks[0].processGroupId).toBe(123);
     });
 
     it('listTasks should prune exited tasks', async () => {
@@ -1188,6 +1334,40 @@ describe('SSHClient', () => {
       const result = await client.listTasks();
       expect(result.tasks).toHaveLength(0);
       expect(client.taskManager.get('task_done')).toBeNull();
+    });
+
+    it('stopTask should kill process group and remove task after verification', async () => {
+      client.taskManager.tasks.set('task_stop', {
+        hostAlias: 'test', remotePid: 12345, processGroupId: 12345, command: 'sleep 100',
+        startedAt: Date.now(), logFile: '/tmp/log',
+      });
+      const runSpy = vi.spyOn(client, 'runRemoteCommand').mockImplementation(async (_hostAlias, command) => {
+        expect(command).toContain('kill -TERM -- "-$pgid"');
+        expect(command).toContain('kill -KILL -- "-$pgid"');
+        return { code: 0, stdout: 'STOPPED\n', stderr: '', duration: 5 };
+      });
+
+      const result = await client.stopTask('task_stop');
+      expect(result.success).toBe(true);
+      expect(result.stopped).toBe(true);
+      expect(result.processGroupId).toBe(12345);
+      expect(client.taskManager.get('task_stop')).toBeNull();
+      expect(runSpy).toHaveBeenCalledTimes(1);
+    });
+
+    it('stopTask should keep task when remote verification finds remaining processes', async () => {
+      client.taskManager.tasks.set('task_stuck', {
+        hostAlias: 'test', remotePid: 12345, processGroupId: 12345, command: 'sleep 100',
+        startedAt: Date.now(), logFile: '/tmp/log',
+      });
+      vi.spyOn(client, 'runRemoteCommand').mockResolvedValue({
+        code: 0, stdout: 'REMAINING 12345\n', stderr: '', duration: 5,
+      });
+
+      const result = await client.stopTask('task_stuck');
+      expect(result.success).toBe(false);
+      expect(result.errorType).toBe('process_still_running');
+      expect(client.taskManager.get('task_stuck')).not.toBeNull();
     });
   });
 
@@ -1233,6 +1413,36 @@ describe('SSHClient', () => {
       const status = await client.checkConnectivity('test', { timeout: 60000 });
       expect(status.connected).toBe(true);
       expect(runSpy).toHaveBeenCalledWith('test', 'echo connected', { useSession: false, timeout: 60000 });
+    });
+  });
+
+  describe('inspectRemote', () => {
+    it('should filter the MCP wrapper process and return matching ports', async () => {
+      const runSpy = vi.spyOn(client, 'runRemoteCommand').mockImplementation(async (_hostAlias, command) => {
+        const marker = command.match(/(MCP_INSPECT_\d+_\d+_[a-z0-9]+)/)[1];
+        return {
+          code: 0,
+          stdout: [
+            `${marker}_PROCESS_START`,
+            `999|1|999|S|00:01|0.1|0.1|1000|bash|bash -c ${marker}`,
+            '12345|1|12345|S|00:02|4.0|2.0|50000|python|python -m vllm.entrypoints.openai.api_server',
+            `${marker}_PROCESS_END`,
+            `${marker}_PORT_START`,
+            'LISTEN 0 4096 127.0.0.1:8000 0.0.0.0:* users:(("python",pid=12345,fd=7))',
+            `${marker}_PORT_END`,
+          ].join('\n'),
+          stderr: '',
+          remotePid: 999,
+        };
+      });
+
+      const result = await client.inspectRemote('test', { processPattern: 'vllm', ports: [8000] });
+      expect(result.success).toBe(true);
+      expect(result.processes).toHaveLength(1);
+      expect(result.processes[0].pid).toBe(12345);
+      expect(result.portsListening[0].port).toBe(8000);
+      expect(result.summary.wrapperFiltered).toBe(true);
+      expect(runSpy).toHaveBeenCalledTimes(1);
     });
   });
 });
