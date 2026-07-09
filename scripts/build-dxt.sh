@@ -33,14 +33,15 @@ mkdir -p "$STAGE_DIR"
 
 echo -e "${YELLOW}Preparing DXT staging directory...${NC}"
 
-cp package.json package-lock.json manifest.json server.mjs README.md CHANGELOG.md LICENSE "$STAGE_DIR/"
-cp -R bin doc "$STAGE_DIR/"
+cp package.json package-lock.json manifest.json server.mjs CHANGELOG.md LICENSE "$STAGE_DIR/"
+cp -R bin src "$STAGE_DIR/"
+find "$STAGE_DIR/src" -name "*.test.mjs" -delete
 
 echo -e "${YELLOW}Installing production dependencies...${NC}"
 (cd "$STAGE_DIR" && npm install --omit=dev --omit=optional --ignore-scripts)
 
 echo -e "${YELLOW}Creating DXT package...${NC}"
-npx dxt pack "$STAGE_DIR" "$DXT_PATH"
+node node_modules/@anthropic-ai/dxt/dist/cli/cli.js pack "$STAGE_DIR" "$DXT_PATH"
 
 rm -rf "$STAGE_DIR"
 

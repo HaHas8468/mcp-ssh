@@ -1542,13 +1542,22 @@ printf 'REMAINING %s\\n' "$__mcp_remaining"
     }
     task.lastExitCode = recentExitCode;
 
-    const readyByLog = statusOptions.readyPattern
+    const currentReadyByLog = statusOptions.readyPattern
       ? safeRegexTest(statusOptions.readyPattern, recentLog)
+      : null;
+    if (currentReadyByLog) {
+      task.lastReadyByLog = true;
+      task.lastReadyPattern = statusOptions.readyPattern;
+      task.lastReadyAt = Date.now();
+    }
+    const readyByLog = statusOptions.readyPattern
+      ? Boolean(currentReadyByLog || (task.lastReadyByLog && task.lastReadyPattern === statusOptions.readyPattern))
       : null;
     const readyByPort = statusOptions.ports.length > 0
       ? statusOptions.ports.every(port => portsListening.some(entry => entry.port === port))
       : (portsListening.length > 0 ? true : null);
-    const ready = readyByLog !== null ? readyByLog : readyByPort;
+    const readySignals = [readyByLog, readyByPort].filter(value => value !== null);
+    const ready = readySignals.length > 0 ? readySignals.some(Boolean) : null;
     const resources = summarizeResources(processTree);
 
     return {
@@ -1739,6 +1748,15 @@ fi
     }
   }
 
+  _isMcpWrapperProcess(proc, currentInspectMarker) {
+    const args = proc.args || '';
+    if (currentInspectMarker && args.includes(currentInspectMarker)) return true;
+    if (/MCP_(INSPECT|BATCH)_\d+_\d+_[a-z0-9]+/.test(args)) return true;
+    if (/MCP_TASK_\d+_\d+_[a-z0-9]+/.test(args) && !args.includes('__mcp_task_rc') && !args.includes('/tmp/mcp-task-')) return true;
+    if (/MCP_\d+_\d+_[a-z0-9]+/.test(args) && args.includes('__mcp_ssh_rc')) return true;
+    return false;
+  }
+
   async inspectRemote(hostAlias, options = {}) {
     this._assertSafeHostAlias(hostAlias);
     await this._assertKnownHostAlias(hostAlias);
@@ -1771,7 +1789,7 @@ fi
     const portText = this._extractMarkedBlock(result.stdout, `${marker}_PORT_START`, `${marker}_PORT_END`);
     let processes = parseProcessTree(processText)
       .filter(proc => proc.pid !== result.remotePid && proc.ppid !== result.remotePid)
-      .filter(proc => !/MCP_(INSPECT|TASK|BATCH)_/.test(proc.args));
+      .filter(proc => !this._isMcpWrapperProcess(proc, marker));
 
     const regex = this._compileUserPattern(options.processPattern);
     const literalPattern = regex ? null : (options.processPattern ? String(options.processPattern) : null);

@@ -121,18 +121,55 @@ function summarizeResources(processTree) {
   }), { cpuPercent: 0, memPercent: 0, rssKb: 0 });
 }
 
+function parsePortFromAddress(localAddress) {
+  const match = String(localAddress || '').match(/:(\d+)$/);
+  return match ? Number.parseInt(match[1], 10) : null;
+}
+
+function parseLsofListeningPort(line) {
+  const columns = line.trim().split(/\s+/);
+  if (columns.length < 9 || columns[7] !== 'TCP') return null;
+
+  const pid = Number.parseInt(columns[1], 10);
+  const localAddress = columns.slice(8).join(' ').replace(/\s+\(LISTEN\)$/, '');
+  const port = parsePortFromAddress(localAddress);
+  if (!port) return null;
+
+  return {
+    localAddress,
+    port,
+    pids: Number.isSafeInteger(pid) ? [pid] : [],
+  };
+}
+
+function parseSsListeningPort(line) {
+  const columns = line.trim().split(/\s+/);
+  const localAddress = columns.find((column, index) => (
+    index >= 2 &&
+    /:\d+$/.test(column) &&
+    !column.includes('pid=') &&
+    !column.includes('fd=')
+  )) || '';
+  const port = parsePortFromAddress(localAddress);
+  if (!port) return null;
+
+  return {
+    localAddress,
+    port,
+    pids: [...line.matchAll(/pid=(\d+)/g)].map(m => Number.parseInt(m[1], 10)),
+  };
+}
+
 function parseListeningPorts(text, allowedPids = [], portsFilter = []) {
-  const allowed = new Set(allowedPids);
-  const wantedPorts = new Set(portsFilter);
+  const allowed = new Set(allowedPids.map(pid => Number.parseInt(pid, 10)).filter(Number.isSafeInteger));
+  const wantedPorts = new Set(portsFilter.map(port => Number.parseInt(port, 10)).filter(Number.isSafeInteger));
   const ports = [];
   for (const line of String(text || '').split(/\r?\n/).filter(Boolean)) {
-    const pids = [...line.matchAll(/pid=(\d+)/g)].map(m => Number.parseInt(m[1], 10));
-    if (allowed.size > 0 && pids.length > 0 && !pids.some(pid => allowed.has(pid))) continue;
-    const columns = line.trim().split(/\s+/);
-    const localAddress = columns[3] || columns[2] || '';
-    const portMatch = localAddress.match(/:(\d+)$/);
-    const port = portMatch ? Number.parseInt(portMatch[1], 10) : null;
-    if (wantedPorts.size > 0 && (!port || !wantedPorts.has(port))) continue;
+    const parsed = parseLsofListeningPort(line) || parseSsListeningPort(line);
+    if (!parsed) continue;
+    const { localAddress, port, pids } = parsed;
+    if (allowed.size > 0 && (pids.length === 0 || !pids.some(pid => allowed.has(pid)))) continue;
+    if (wantedPorts.size > 0 && !wantedPorts.has(port)) continue;
     ports.push({
       protocol: 'tcp',
       localAddress,

@@ -96,4 +96,25 @@ describe('task-status helpers', () => {
     expect(ports[0].port).toBe(8000);
     expect(ports[0].pids).toEqual([123]);
   });
+
+  it('parses lsof listening ports and applies pid and port filters', () => {
+    const ports = parseListeningPorts(
+      [
+        'sshd         1 root    3u  IPv4 743203833      0t0  TCP *:22 (LISTEN)',
+        'code-fc3d 1897 root   10u  IPv4 746074351      0t0  TCP 127.0.0.1:34753 (LISTEN)',
+      ].join('\n'),
+      [1897],
+      [34753]
+    );
+
+    expect(ports).toEqual([
+      {
+        protocol: 'tcp',
+        localAddress: '127.0.0.1:34753',
+        port: 34753,
+        pids: [1897],
+        raw: 'code-fc3d 1897 root   10u  IPv4 746074351      0t0  TCP 127.0.0.1:34753 (LISTEN)',
+      },
+    ]);
+  });
 });

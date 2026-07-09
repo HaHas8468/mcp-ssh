@@ -1312,6 +1312,96 @@ describe('SSHClient', () => {
       expect(result.log.tailBytes).toBe(4096);
     });
 
+    it('getTaskStatus should keep log readiness after an empty onlyNew window', async () => {
+      client.taskManager.tasks.set('task_ready', {
+        hostAlias: 'test', remotePid: 12345, processGroupId: 12345, command: 'vllm serve model',
+        startedAt: Date.now(), logFile: '/tmp/mcp-task-task_ready.log', exitFile: '/tmp/mcp-task-task_ready.exit',
+        lastLogOffset: 0, lastReadyByLog: false, lastReadyPattern: null, lastReadyAt: null,
+      });
+      let calls = 0;
+      vi.spyOn(client, 'runRemoteCommand').mockImplementation(async (_hostAlias, command) => {
+        const marker = command.match(/(MCP_TASK_\d+_\d+_[a-z0-9]+)/)[1];
+        calls += 1;
+        return {
+          code: 0,
+          stdout: [
+            `${marker}_PROCESS_START`,
+            '12345 1 12345 S 00:01 python',
+            `${marker}_PROCESS_END`,
+            `${marker}_TREE_START`,
+            '12345|1|12345|S|00:01|1.0|0.5|1024|python|python -m vllm.entrypoints.openai.api_server',
+            `${marker}_TREE_END`,
+            `${marker}_PORT_START`,
+            `${marker}_PORT_END`,
+            `${marker}_EXIT_START`,
+            'exitCode=',
+            `${marker}_EXIT_END`,
+            `${marker}_LOG_META_START`,
+            'size=12',
+            calls === 1 ? 'start=0' : 'start=12',
+            'end=12',
+            'onlyNew=true',
+            `${marker}_LOG_META_END`,
+            `${marker}_LOG_START`,
+            calls === 1 ? 'server ready' : '',
+            `${marker}_LOG_END`,
+          ].join('\n'),
+          stderr: '',
+          duration: 5,
+        };
+      });
+
+      const first = await client.getTaskStatus('task_ready', { onlyNew: true, readyPattern: 'ready' });
+      const second = await client.getTaskStatus('task_ready', { onlyNew: true, readyPattern: 'ready' });
+      expect(first.health.ready).toBe(true);
+      expect(second.recentLog).toBe('');
+      expect(second.health.ready).toBe(true);
+      expect(second.health.readyByLog).toBe(true);
+    });
+
+    it('getTaskStatus should allow ports to satisfy readiness when the log does not match', async () => {
+      client.taskManager.tasks.set('task_port_ready', {
+        hostAlias: 'test', remotePid: 12345, processGroupId: 12345, command: 'vllm serve model',
+        startedAt: Date.now(), logFile: '/tmp/mcp-task-task_port_ready.log', exitFile: '/tmp/mcp-task-task_port_ready.exit',
+      });
+      vi.spyOn(client, 'runRemoteCommand').mockImplementation(async (_hostAlias, command) => {
+        const marker = command.match(/(MCP_TASK_\d+_\d+_[a-z0-9]+)/)[1];
+        return {
+          code: 0,
+          stdout: [
+            `${marker}_PROCESS_START`,
+            '12345 1 12345 S 00:01 python',
+            `${marker}_PROCESS_END`,
+            `${marker}_TREE_START`,
+            '12345|1|12345|S|00:01|1.0|0.5|1024|python|python -m vllm.entrypoints.openai.api_server',
+            `${marker}_TREE_END`,
+            `${marker}_PORT_START`,
+            'LISTEN 0 4096 127.0.0.1:8000 0.0.0.0:* users:(("python",pid=12345,fd=7))',
+            `${marker}_PORT_END`,
+            `${marker}_EXIT_START`,
+            'exitCode=',
+            `${marker}_EXIT_END`,
+            `${marker}_LOG_META_START`,
+            'size=8',
+            'start=0',
+            'end=8',
+            'onlyNew=false',
+            `${marker}_LOG_META_END`,
+            `${marker}_LOG_START`,
+            'starting',
+            `${marker}_LOG_END`,
+          ].join('\n'),
+          stderr: '',
+          duration: 5,
+        };
+      });
+
+      const result = await client.getTaskStatus('task_port_ready', { readyPattern: 'ready', ports: [8000] });
+      expect(result.health.readyByLog).toBe(false);
+      expect(result.health.readyByPort).toBe(true);
+      expect(result.health.ready).toBe(true);
+    });
+
     it('listTasks should return running tasks', async () => {
       client.taskManager.tasks.set('task_1', {
         hostAlias: 'test', remotePid: 123, command: 'ls',
@@ -1443,6 +1533,30 @@ describe('SSHClient', () => {
       expect(result.portsListening[0].port).toBe(8000);
       expect(result.summary.wrapperFiltered).toBe(true);
       expect(runSpy).toHaveBeenCalledTimes(1);
+    });
+
+    it('should filter transient exec wrappers while keeping background task wrappers', async () => {
+      vi.spyOn(client, 'runRemoteCommand').mockImplementation(async (_hostAlias, command) => {
+        const marker = command.match(/(MCP_INSPECT_\d+_\d+_[a-z0-9]+)/)[1];
+        return {
+          code: 0,
+          stdout: [
+            `${marker}_PROCESS_START`,
+            `900|1|900|S|00:01|0.1|0.1|1000|bash|bash -c printf '%s\\n' 'MCP_111_222_abc123START'; sleep 30; __mcp_ssh_rc=$?`,
+            "901|1|901|S|00:02|0.1|0.1|1000|bash|bash -c set +e; vllm serve model; __mcp_task_rc=$?; printf '%s\\n' \"$__mcp_task_rc\" > '/tmp/mcp-task-task_keep.exit'",
+            '902|1|902|S|00:03|1.0|0.5|2048|python|python app.py',
+            `${marker}_PROCESS_END`,
+            `${marker}_PORT_START`,
+            `${marker}_PORT_END`,
+          ].join('\n'),
+          stderr: '',
+          remotePid: 999,
+        };
+      });
+
+      const result = await client.inspectRemote('test', { processPattern: 'bash|python' });
+      expect(result.success).toBe(true);
+      expect(result.processes.map(proc => proc.pid)).toEqual([901, 902]);
     });
   });
 });

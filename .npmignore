@@ -1,5 +1,4 @@
 # Development files
-src/
 tsconfig.json
 .vscode/
 IMPLEMENTATION_NOTES.md
@@ -33,7 +32,7 @@ coverage/
 
 # Keep these files for npm package
 !package.json
-!README.md
 !server.mjs
+!src/
 !LICENSE
 !CHANGELOG.md

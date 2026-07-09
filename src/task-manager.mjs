@@ -23,6 +23,9 @@ class TaskManager {
       exitFile: options.exitFile || `/tmp/mcp-task-${taskId}.exit`,
       lastLogOffset: 0,
       lastExitCode: null,
+      lastReadyByLog: false,
+      lastReadyPattern: null,
+      lastReadyAt: null,
     });
     return taskId;
   }
