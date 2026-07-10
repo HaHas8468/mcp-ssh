@@ -21,7 +21,7 @@ class CredentialProvider {
     return this.keytar;
   }
 
-  async passwordFor(target) {
+  async passwordFor(target, options = {}) {
     const keytar = await this._keytar();
     if (keytar) {
       try {
@@ -29,7 +29,7 @@ class CredentialProvider {
         if (password) return password;
       } catch { /* Keychain is optional. */ }
     }
-    return this.catalog?.passwordFor(target) || null;
+    return this.catalog?.passwordFor(target, options) || null;
   }
 
   async askpassScript() {
@@ -46,8 +46,8 @@ class CredentialProvider {
     return path;
   }
 
-  async environment(target) {
-    const password = await this.passwordFor(target);
+  async environment(target, options = {}) {
+    const password = await this.passwordFor(target, options);
     if (!password) return null;
     return {
       ...process.env,

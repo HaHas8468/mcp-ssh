@@ -5,6 +5,15 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+- SSH/SCP 调用现在使用独立本地进程组，并在 POSIX `/proc` 可用时递归终止脱离根进程组的 OpenSSH/ProxyJump 后代；取消、超时和服务关闭会清理活动进程登记与 TERM→KILL 升级定时器。
+- `timeoutMs` 现在覆盖目标解析、连接准备、远程执行和清理，不再只限制最终 SSH 子进程。
+- 冷启动会先校验并接管健康的既有 ControlMaster；跨 MCP 进程使用原子锁与 generation token 协调 check/remove/open，避免误删刚重建的 socket。
+- 无论 SSH 退出码为何，均识别并剥离本地 mux 降级诊断；已完成操作保持成功并返回 `SSH_MASTER_DEGRADED` warning，确认未开始的操作仅安全重试一次，状态不明的写入与后台任务不重放。
+- stdio 关闭及 `SIGTERM`/`SIGINT`/`SIGHUP` 现在统一取消活动操作并等待本地 SSH 子进程退出；`SIGCONT` 会恢复活动进程组并强制所有连接在下一次使用前执行健康检查。
+
 ## [3.0.0] - 2026-07-10
 
 ### Changed

@@ -5,6 +5,7 @@ import { homedir } from 'os';
 import { createRequire } from 'module';
 import { assertTargetId, TARGET_ID_RE, configFingerprint, parseSshG } from '../domain/target.mjs';
 import { ERROR_CODES, OperationFailure } from '../domain/errors.mjs';
+import { throwIfAborted } from './operation-control.mjs';
 
 const require = createRequire(import.meta.url);
 const { globSync } = require('glob');
@@ -85,7 +86,8 @@ class TargetCatalog {
     return this.cache && this.now() - this.cacheAt < ttl;
   }
 
-  async _scanFile(path, visited, entries, passwords, sources) {
+  async _scanFile(path, visited, entries, passwords, sources, options = {}) {
+    throwIfAborted({ ...options, phase: 'resolve' });
     const absolute = resolve(path);
     if (visited.has(absolute)) return;
     visited.add(absolute);
@@ -105,7 +107,7 @@ class TargetCatalog {
       // OpenSSH accepts more than one Include path on a single directive.
       for (const pattern of include.value.match(/(?:[^\s"']+|"[^"]*"|'[^']*')+/g) || []) {
         for (const includePath of this._expandInclude(unquote(pattern), absolute)) {
-          await this._scanFile(includePath, visited, entries, passwords, sources);
+          await this._scanFile(includePath, visited, entries, passwords, sources, options);
         }
       }
     }
@@ -118,12 +120,14 @@ class TargetCatalog {
     return existsSync(target) ? [target] : [];
   }
 
-  async list() {
+  async list(options = {}) {
+    throwIfAborted({ ...options, phase: 'resolve' });
     if (await this._fresh()) return this.cache.targets.map(target => ({ ...target }));
     const entries = new Map();
     const passwords = new Map();
     const sources = new Set();
-    await this._scanFile(this.configPath, new Set(), entries, passwords, sources);
+    await this._scanFile(this.configPath, new Set(), entries, passwords, sources, options);
+    throwIfAborted({ ...options, phase: 'resolve' });
     const targets = [...entries.values()].sort((a, b) => a.id.localeCompare(b.id));
     this.cache = { targets, passwords, sources };
     this.cacheAt = this.now();
@@ -133,9 +137,9 @@ class TargetCatalog {
     return targets.map(target => ({ ...target }));
   }
 
-  async assertAllowed(target) {
+  async assertAllowed(target, options = {}) {
     assertTargetId(target);
-    const targets = await this.list();
+    const targets = await this.list(options);
     if (!targets.some(entry => entry.id === target)) {
       throw new OperationFailure(ERROR_CODES.TARGET_NOT_FOUND, `目标 '${target}' 未在 SSH 配置中显式定义。`, {
         phase: 'resolve', hint: '请在 ~/.ssh/config 或其 Include 文件中添加明确的 Host 别名。',
@@ -144,12 +148,12 @@ class TargetCatalog {
     return target;
   }
 
-  async effective(target) {
-    await this.assertAllowed(target);
+  async effective(target, options = {}) {
+    await this.assertAllowed(target, options);
     const cached = this.effectiveCache.get(target);
     if (cached && await this._fresh()) return cached;
     let resolved;
-    try { resolved = await this.adapter.resolve(target); }
+    try { resolved = await this.adapter.resolve(target, options); }
     catch (error) {
       if (error instanceof OperationFailure) throw error;
       throw new OperationFailure(ERROR_CODES.SSH_CONFIG_INVALID, `无法解析 SSH 目标 '${target}'：${error.message}`, { phase: 'resolve', cause: error });
@@ -163,8 +167,8 @@ class TargetCatalog {
     return value;
   }
 
-  async passwordFor(target) {
-    await this.list();
+  async passwordFor(target, options = {}) {
+    await this.list(options);
     const entry = this.cache.passwords.get(target);
     if (!entry) return null;
     try {

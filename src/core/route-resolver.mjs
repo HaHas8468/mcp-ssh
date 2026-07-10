@@ -1,5 +1,6 @@
 import { configValue } from '../domain/target.mjs';
 import { ERROR_CODES, OperationFailure } from '../domain/errors.mjs';
+import { throwIfAborted } from './operation-control.mjs';
 
 function parseJumpSpec(value) {
   const text = String(value || '').trim();
@@ -26,15 +27,17 @@ class RouteResolver {
     this.catalog?.subscribe(() => this.cache.clear());
   }
 
-  async resolve(target) {
+  async resolve(target, options = {}) {
+    throwIfAborted({ ...options, phase: 'resolve' });
     const cached = this.cache.get(target);
     if (cached) return cached;
-    const value = await this._resolveTarget(target, [], []);
+    const value = await this._resolveTarget(target, [], [], options);
     this.cache.set(target, value);
     return value;
   }
 
-  async _resolveTarget(target, stack, accumulated) {
+  async _resolveTarget(target, stack, accumulated, options = {}) {
+    throwIfAborted({ ...options, phase: 'resolve' });
     const settings = await this.config.load();
     if (stack.includes(target)) {
       throw new OperationFailure(ERROR_CODES.ROUTE_CYCLE, `检测到 ProxyJump 循环：${[...stack, target].join(' → ')}`, { phase: 'resolve' });
@@ -42,7 +45,7 @@ class RouteResolver {
     if (stack.length >= settings.maxRouteDepth) {
       throw new OperationFailure(ERROR_CODES.ROUTE_TOO_DEEP, `SSH 路由超过最大深度 ${settings.maxRouteDepth}。`, { phase: 'resolve' });
     }
-    const effective = await this.catalog.effective(target);
+    const effective = await this.catalog.effective(target, options);
     const cfg = effective.config;
     const proxyCommand = configValue(cfg, 'proxycommand', 'none');
     const proxyJumps = parseProxyJump(configValue(cfg, 'proxyjump', 'none'));
@@ -64,9 +67,9 @@ class RouteResolver {
       if (route.length >= settings.maxRouteDepth) {
         throw new OperationFailure(ERROR_CODES.ROUTE_TOO_DEEP, `SSH 路由超过最大深度 ${settings.maxRouteDepth}。`, { phase: 'resolve' });
       }
-      const explicit = await this.catalog.list();
+      const explicit = await this.catalog.list(options);
       if (explicit.some(entry => entry.id === jump.alias)) {
-        const nested = await this._resolveTarget(jump.alias, [...stack, target], route);
+        const nested = await this._resolveTarget(jump.alias, [...stack, target], route, options);
         // _resolveTarget receives the already-built prefix. Only append its new
         // hops; otherwise multi-hop routes would duplicate earlier jumps.
         const appended = nested.route.slice(route.length).map((hop, index) => ({ ...hop, depth: route.length + index }));

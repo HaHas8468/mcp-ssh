@@ -4,6 +4,8 @@ import { ERROR_CODES, OperationFailure } from '../domain/errors.mjs';
 import { createRequestId, emptyTiming, successResult, failureResult } from '../domain/result.mjs';
 import { summarizeBuffer } from '../core/output-store.mjs';
 import { classifySshFailure } from '../adapters/openssh-adapter.mjs';
+import { createDeadline, throwIfAborted } from '../core/operation-control.mjs';
+import { evictDegradedMaster } from '../core/master-recovery.mjs';
 
 const ENV_KEY_RE = /^[A-Za-z_][A-Za-z0-9_]*$/;
 
@@ -123,11 +125,11 @@ class ExecService {
     this.policy = policy;
   }
 
-  async _prepare(targetId) {
+  async _prepare(targetId, options = {}) {
     const resolveStartedAt = Date.now();
-    const target = await this.resolver.resolve(targetId);
+    const target = await this.resolver.resolve(targetId, options);
     const resolveMs = Date.now() - resolveStartedAt;
-    const lease = await this.connections.ensureReady(target);
+    const lease = await this.connections.ensureReady(target, options);
     return { target, lease, resolveMs };
   }
 
@@ -137,35 +139,51 @@ class ExecService {
     let target;
     let timing = emptyTiming(startedAt);
     let partialData = {};
+    let warnings = [];
     try {
       validateExecution(args);
       const config = await this.config.load();
       const timeoutMs = boundedTimeout(args.timeoutMs, config);
+      const deadline = createDeadline(timeoutMs, startedAt);
       const outputLimitBytes = boundedOutput(args.outputLimitBytes, config);
+      throwIfAborted({ signal: context.signal, deadline, phase: 'validate' });
       await this.policy?.check(args.target, 'ssh_exec', { command: args.command });
       const danger = this.policy?.dangerous(args.command) || detectDangerousCommand(args.command);
       if (danger.detected) {
         const approved = context.requestApproval ? await context.requestApproval({ target: args.target, command: args.command, danger }) : false;
         if (!approved) throw new OperationFailure(ERROR_CODES.APPROVAL_REQUIRED, `危险操作需要真实用户批准：${danger.message}`, { phase: 'validate', retryable: false });
       }
-      const prepared = await this._prepare(args.target);
+      const prepared = await this._prepare(args.target, { signal: context.signal, deadline });
       target = prepared.target;
+      warnings = [...(target.warnings || [])];
       timing.resolveMs = prepared.resolveMs;
       timing.connectionWaitMs = prepared.lease.connectionWaitMs;
       timing.connectMs = prepared.lease.connectMs;
       timing.connectionReused = prepared.lease.connectionReused;
-      if (args.detach) return await this._detach({ args, requestId, startedAt, timing, target, lease: prepared.lease, timeoutMs, context });
+      if (args.detach) return await this._detach({ args, requestId, startedAt, timing, target, lease: prepared.lease, timeoutMs, deadline, context, warnings });
       const command = buildExecutionCommand({ requestId, command: args.command, cwd: args.cwd, env: args.env });
       const executeStartedAt = Date.now();
-      const transport = await this.adapter.exec({ target, command, controlPath: prepared.lease.controlPath, timeoutMs, signal: context.signal, onProgress: context.onProgress });
+      const cleanupReserveMs = Math.min(5_000, Math.max(100, Math.floor(timeoutMs / 10)));
+      const executionDeadline = Math.min(deadline, Math.max(Date.now() + 1, deadline - cleanupReserveMs));
+      let lease = prepared.lease;
+      let transport = await this.adapter.exec({ target, command, controlPath: lease.controlPath, timeoutMs, deadline: executionDeadline, signal: context.signal, onProgress: context.onProgress });
+      let marker = removeExecutionMarkers(transport.stdout, requestId);
+      if (transport.masterDegraded) {
+        await evictDegradedMaster(this.connections, lease, transport, warnings);
+        if (!marker.started && !transport.cancelled && !transport.timedOut) {
+          lease = await this.connections.ensureReady(target, { signal: context.signal, deadline, forceCheck: true });
+          transport = await this.adapter.exec({ target, command, controlPath: lease.controlPath, timeoutMs, deadline: executionDeadline, signal: context.signal, onProgress: context.onProgress });
+          marker = removeExecutionMarkers(transport.stdout, requestId);
+          await evictDegradedMaster(this.connections, lease, transport, warnings);
+        }
+      }
       timing.executeMs = Date.now() - executeStartedAt;
-      const marker = removeExecutionMarkers(transport.stdout, requestId);
       const output = await outputData(marker.stdout, transport.stderr, outputLimitBytes, requestId, this.outputStore);
       partialData = { output };
       timing.totalMs = Date.now() - startedAt;
       if (transport.timedOut || transport.cancelled) {
         const cleanupStartedAt = Date.now();
-        const cleanup = await this._cleanupExecution(target, prepared.lease.controlPath, requestId).catch(() => ({ confirmed: false }));
+        const cleanup = await this._cleanupExecution(target, lease.controlPath, requestId, { deadline }).catch(() => ({ confirmed: false }));
         timing.cleanupMs = Date.now() - cleanupStartedAt;
         throw new OperationFailure(
           transport.cancelled ? ERROR_CODES.REMOTE_COMMAND_CANCELLED : ERROR_CODES.REMOTE_COMMAND_TIMEOUT,
@@ -176,11 +194,13 @@ class ExecService {
       if (transport.spawnError) {
         throw new OperationFailure(ERROR_CODES.LOCAL_SPAWN_FAILED, '无法启动本地 ssh 进程。', { phase: 'execute', cause: transport.spawnError });
       }
-      if (transport.code === 255 && marker.started && !marker.completed) {
+      if ((transport.code === 255 || transport.masterDegraded) && marker.started && !marker.completed) {
         throw new OperationFailure(ERROR_CODES.EXECUTION_STATE_UNKNOWN, 'SSH 连接在远程命令状态确认前断开。', { phase: 'execute', retryable: false, mayHaveRun: true });
       }
-      if (transport.code === 255) {
-        const category = classifySshFailure(transport.stderr, 'connect');
+      if (transport.code === 255 && !marker.completed) {
+        const category = transport.masterDegraded
+          ? { code: ERROR_CODES.SSH_MASTER_FAILED, phase: 'connect', retryable: true }
+          : classifySshFailure(transport.stderr, 'connect');
         throw new OperationFailure(category.code, transport.stderr || 'SSH 连接失败。', { ...category, mayHaveRun: marker.started });
       }
       const exitCode = marker.exitCode ?? transport.code ?? 255;
@@ -188,27 +208,28 @@ class ExecService {
       partialData = data;
       if (exitCode !== 0) {
         const failure = new OperationFailure(ERROR_CODES.REMOTE_COMMAND_FAILED, `远程命令以退出码 ${exitCode} 结束。`, { phase: 'execute', retryable: false, isProtocolError: false });
-        return failureResult({ requestId, operation: 'exec', target: target.id, timing, data, warnings: target.warnings, error: failure });
+        return failureResult({ requestId, operation: 'exec', target: target.id, timing, data, warnings, error: failure });
       }
-      return successResult({ requestId, operation: 'exec', target: target.id, timing, data, warnings: target.warnings });
+      return successResult({ requestId, operation: 'exec', target: target.id, timing, data, warnings });
     } catch (error) {
       timing.totalMs = Date.now() - startedAt;
-      return failureResult({ requestId, operation: 'exec', target: target?.id || args?.target, timing, data: partialData, error });
+      return failureResult({ requestId, operation: 'exec', target: target?.id || args?.target, timing, data: partialData, warnings, error });
     }
   }
 
-  async _detach({ args, requestId, startedAt, timing, target, lease, timeoutMs, context }) {
+  async _detach({ args, requestId, startedAt, timing, target, lease, timeoutMs, deadline, context, warnings }) {
     const taskId = `task_${randomUUID()}`;
     const executeStartedAt = Date.now();
     const transport = await this.adapter.exec({
       target,
       command: buildDetachCommand({ taskId, command: args.command, cwd: args.cwd, env: args.env }),
-      controlPath: lease.controlPath, timeoutMs, signal: context.signal, onProgress: context.onProgress,
+      controlPath: lease.controlPath, timeoutMs, deadline, signal: context.signal, onProgress: context.onProgress,
     });
     timing.executeMs = Date.now() - executeStartedAt;
     timing.totalMs = Date.now() - startedAt;
     const marker = String(transport.stdout).match(new RegExp(`__MCP_SSH_TASK_${taskId}=([^|]+)\\|([^|]+)\\|([^\\r\\n]+)`));
-    if (transport.code !== 0 || !marker) {
+    await evictDegradedMaster(this.connections, lease, transport, warnings);
+    if (transport.code !== 0 || !marker || transport.masterDegraded) {
       throw new OperationFailure(ERROR_CODES.EXECUTION_STATE_UNKNOWN, '后台任务启动状态无法确认。', { phase: 'execute', retryable: false, mayHaveRun: true });
     }
     const task = {
@@ -217,19 +238,22 @@ class ExecService {
       createdAt: Date.now(), state: 'running',
     };
     await this.taskStore.create(task);
-    return successResult({ requestId, operation: 'exec', target: target.id, timing, data: { detached: true, taskId, remotePid: task.remotePid, processGroupId: task.processGroupId, logRef: `mcp-ssh://tasks/${taskId}/log` }, warnings: target.warnings });
+    return successResult({ requestId, operation: 'exec', target: target.id, timing, data: { detached: true, taskId, remotePid: task.remotePid, processGroupId: task.processGroupId, logRef: `mcp-ssh://tasks/${taskId}/log` }, warnings });
   }
 
-  async _cleanupExecution(target, controlPath, requestId) {
+  async _cleanupExecution(target, controlPath, requestId, { deadline } = {}) {
     const command = [
       'set +e', `__mcp_state="${'${TMPDIR:-/tmp}'}/.mcp-ssh/request-${requestId}"`,
       '[ -r "$__mcp_state" ] || exit 0',
       '__mcp_pgid=$(sed -n "s/^pgid=//p" "$__mcp_state" | head -n 1)',
       '[ -n "$__mcp_pgid" ] || exit 1',
+      'printf "cleanupAttempted\\n" >> "$__mcp_state"',
       'kill -TERM -- "-$__mcp_pgid" 2>/dev/null', 'sleep 1', 'kill -KILL -- "-$__mcp_pgid" 2>/dev/null',
-      'kill -0 -- "-$__mcp_pgid" 2>/dev/null && exit 1 || exit 0',
+      'if ps -o stat= -g "$__mcp_pgid" 2>/dev/null | grep -Eqv "^[[:space:]]*Z"; then exit 1; fi',
+      'printf "cleanupConfirmed\\n" >> "$__mcp_state"',
+      'exit 0',
     ].join('\n');
-    const result = await this.adapter.exec({ target, command, controlPath, timeoutMs: 5_000 });
+    const result = await this.adapter.exec({ target, command, controlPath, timeoutMs: 5_000, deadline });
     return { confirmed: result.code === 0 };
   }
 }

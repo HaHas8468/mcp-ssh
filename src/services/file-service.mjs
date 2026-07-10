@@ -2,6 +2,8 @@ import { randomUUID } from 'crypto';
 import { shQuote, validateFileMode } from '../shared.mjs';
 import { ERROR_CODES, OperationFailure } from '../domain/errors.mjs';
 import { createRequestId, emptyTiming, successResult, failureResult } from '../domain/result.mjs';
+import { createDeadline } from '../core/operation-control.mjs';
+import { evictDegradedMaster } from '../core/master-recovery.mjs';
 
 const SHA256_RE = /^[a-f0-9]{64}$/i;
 
@@ -57,6 +59,7 @@ class FileService {
     const startedAt = Date.now();
     const action = args.action;
     let target;
+    let warnings = [];
     const timing = emptyTiming(startedAt);
     try {
       if (!['read', 'write', 'append', 'stat'].includes(action)) {
@@ -64,32 +67,45 @@ class FileService {
       }
       if (typeof args.target !== 'string' || !args.target) throw new OperationFailure(ERROR_CODES.INVALID_ARGUMENT, 'target 为必填项。', { phase: 'validate' });
       assertPath(args.path);
+      const settings = await this.config.load();
+      const deadline = createDeadline(settings.defaultTimeoutMs, startedAt);
       await this.policy?.check(args.target, `ssh_file.${action}`, { path: args.path });
       const resolvedAt = Date.now();
-      target = await this.resolver.resolve(args.target);
+      target = await this.resolver.resolve(args.target, { signal: context.signal, deadline });
       timing.resolveMs = Date.now() - resolvedAt;
-      const lease = await this.connections.ensureReady(target);
+      const lease = await this.connections.ensureReady(target, { signal: context.signal, deadline });
       timing.connectionWaitMs = lease.connectionWaitMs;
       timing.connectMs = lease.connectMs;
       timing.connectionReused = lease.connectionReused;
       const executeAt = Date.now();
+      warnings = [...(target.warnings || [])];
+      const operationContext = { ...context, deadline, warnings };
       let data;
-      if (action === 'read') data = await this._read(target, lease, args, context);
-      else if (action === 'stat') data = await this._stat(target, lease, args, context);
-      else if (action === 'write') data = await this._write(target, lease, args, context);
-      else data = await this._append(target, lease, args, context);
+      if (action === 'read') data = await this._read(target, lease, args, operationContext);
+      else if (action === 'stat') data = await this._stat(target, lease, args, operationContext);
+      else if (action === 'write') data = await this._write(target, lease, args, operationContext);
+      else data = await this._append(target, lease, args, operationContext);
       timing.executeMs = Date.now() - executeAt;
       timing.totalMs = Date.now() - startedAt;
-      return successResult({ requestId, operation: `file.${action}`, target: target.id, timing, data, warnings: target.warnings });
+      return successResult({ requestId, operation: `file.${action}`, target: target.id, timing, data, warnings: operationContext.warnings });
     } catch (error) {
       timing.totalMs = Date.now() - startedAt;
-      return failureResult({ requestId, operation: `file.${action || 'unknown'}`, target: target?.id || args.target, timing, error });
+      return failureResult({ requestId, operation: `file.${action || 'unknown'}`, target: target?.id || args.target, timing, warnings, error });
     }
   }
 
-  async _exec(target, lease, command, context, stdin) {
+  async _exec(target, lease, command, context, stdin, { safeRetry = false } = {}) {
     const settings = await this.config.load();
-    const result = await this.adapter.exec({ target, command, controlPath: lease.controlPath, timeoutMs: settings.defaultTimeoutMs, signal: context.signal, stdin });
+    let activeLease = lease;
+    let result = await this.adapter.exec({ target, command, controlPath: activeLease.controlPath, timeoutMs: settings.defaultTimeoutMs, deadline: context.deadline, signal: context.signal, stdin });
+    if (result.masterDegraded) {
+      await evictDegradedMaster(this.connections, activeLease, result, context.warnings);
+      if (safeRetry && result.code !== 0 && !result.cancelled && !result.timedOut) {
+        activeLease = await this.connections.ensureReady(target, { signal: context.signal, deadline: context.deadline, forceCheck: true });
+        result = await this.adapter.exec({ target, command, controlPath: activeLease.controlPath, timeoutMs: settings.defaultTimeoutMs, deadline: context.deadline, signal: context.signal, stdin });
+        await evictDegradedMaster(this.connections, activeLease, result, context.warnings);
+      }
+    }
     if (result.timedOut || result.cancelled) throw new OperationFailure(result.cancelled ? ERROR_CODES.REMOTE_COMMAND_CANCELLED : ERROR_CODES.REMOTE_COMMAND_TIMEOUT, '文件操作未在规定时间完成。', { phase: 'execute', mayHaveRun: true });
     return result;
   }
@@ -106,7 +122,7 @@ class FileService {
       `printf '${marker}_SHA=%s\\n' "$(${shaCommand(args.path)})"`,
       `dd if="$__mcp_path" bs=1 skip=${offset} count=${limit} 2>/dev/null | base64 | tr -d '\\n' | sed 's/^/${marker}_CONTENT=/'`,
     ].join('\n');
-    const result = await this._exec(target, lease, command, context);
+    const result = await this._exec(target, lease, command, context, undefined, { safeRetry: true });
     if (result.code === 44) throw new OperationFailure(ERROR_CODES.FILE_NOT_FOUND, `远程文件不存在：${args.path}`, { phase: 'execute', retryable: false });
     if (result.code !== 0) throw new OperationFailure(ERROR_CODES.FILE_PERMISSION_DENIED, result.stderr || '无法读取远程文件。', { phase: 'execute' });
     const values = parseMarked(result.stdout, marker);
@@ -131,7 +147,7 @@ class FileService {
       `printf '${marker}_MODIFIED_AT=%s\\n' "$(stat -c '%Y' -- "$__mcp_path" 2>/dev/null || stat -f '%m' "$__mcp_path")"`,
       `printf '${marker}_TYPE=%s\\n' "$(if [ -d "$__mcp_path" ]; then printf directory; elif [ -f "$__mcp_path" ]; then printf file; else printf other; fi)"`,
     ].join('\n');
-    const result = await this._exec(target, lease, command, context);
+    const result = await this._exec(target, lease, command, context, undefined, { safeRetry: true });
     if (result.code === 44) throw new OperationFailure(ERROR_CODES.FILE_NOT_FOUND, `远程文件不存在：${args.path}`, { phase: 'execute' });
     if (result.code !== 0) throw new OperationFailure(ERROR_CODES.FILE_PERMISSION_DENIED, result.stderr || '无法读取远程文件元数据。', { phase: 'execute' });
     const values = parseMarked(result.stdout, marker);
