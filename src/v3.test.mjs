@@ -12,7 +12,7 @@ import { summarizeBuffer } from './core/output-store.mjs';
 import { getToolDefinitions } from './mcp/tools.mjs';
 import { EventEmitter } from 'events';
 import { OpenSshAdapter } from './adapters/openssh-adapter.mjs';
-import { ExecService, buildExecutionCommand } from './services/exec-service.mjs';
+import { ExecService, buildDetachCommand, buildExecutionCommand } from './services/exec-service.mjs';
 import { FileService } from './services/file-service.mjs';
 
 const config = { load: async () => ({ maxRouteDepth: 8, sshConfigCacheTtlMs: 60_000, connectionHealthTtlMs: 60_000, controlMaster: true }) };
@@ -130,6 +130,10 @@ describe('v3 route and connection core', () => {
     expect(result.ok).toBe(true);
     expect(result.data.output.stdout.content).toBe('hello');
     expect(buildExecutionCommand({ requestId: 'id', command: 'true', cwd: '/one', env: { FOO: 'bar' } })).toContain("export FOO='bar'");
+    const detached = buildDetachCommand({ taskId: 'task_id', command: 'true', cwd: '/one', env: { FOO: 'bar' } });
+    expect(detached).toContain('setsid "${SHELL:-/bin/sh}" -c');
+    expect(detached).toContain("cd -- '/one'");
+    expect(detached).toContain("export FOO='bar'");
   });
 
   it('streams file bodies over SSH stdin and reports optimistic-write conflicts', async () => {

@@ -72,7 +72,7 @@ function buildDetachCommand({ taskId, command, cwd, env }) {
   const child = `(${command}); __mcp_rc=$?; printf '%s\\n' "$__mcp_rc" > ${exitPath}`;
   return [
     ...setup,
-    `(setsid sh -c ${shQuote(child)} > ${logPath} 2>&1 < /dev/null & echo $! > "$__mcp_root/${taskId}.pid") &`,
+    `(setsid "${'${SHELL:-/bin/sh}'}" -c ${shQuote(child)} > ${logPath} 2>&1 < /dev/null & echo $! > "$__mcp_root/${taskId}.pid") &`,
     'sleep 0.05',
     `__mcp_pid=$(cat "$__mcp_root/${taskId}.pid")`,
     `printf '__MCP_SSH_TASK_${taskId}=%s|%s|%s\\n' "$__mcp_pid" "$__mcp_root/${taskId}.log" "$__mcp_root/${taskId}.exit"`,
