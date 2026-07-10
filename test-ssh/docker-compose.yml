@@ -1,6 +1,29 @@
 services:
-  ssh-test:
+  jump1:
     build: .
+    hostname: jump1
     ports:
       - "2222:22"
-    container_name: mcp-ssh-test
+    networks:
+      - client_net
+      - jump1_net
+
+  jump2:
+    build: .
+    hostname: jump2
+    networks:
+      - jump1_net
+      - jump2_net
+
+  target:
+    build: .
+    hostname: target
+    networks:
+      - jump2_net
+
+networks:
+  client_net:
+  jump1_net:
+    internal: true
+  jump2_net:
+    internal: true

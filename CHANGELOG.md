@@ -5,6 +5,18 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.0.0] - 2026-07-10
+
+### Changed
+- Replaced the v2 session-oriented API with five v3 tools: `ssh_targets`, `ssh_exec`, `ssh_file`, `ssh_transfer`, and `ssh_task`.
+- SSH targets are now explicit aliases from SSH config; raw `known_hosts` addresses, warmup, sessions, batches, cross-host parallelism, and hidden shell state are no longer public API.
+- All tool responses use stable operation results, structured MCP content, output schemas, request IDs, timings, and error codes.
+
+### Added
+- Added `ssh -G` effective-config resolution, recursive ProxyJump route resolution, route-cycle detection, and configuration fingerprints.
+- Added final-target ControlMaster connection reuse with health checks, single-flight connection creation, stale socket cleanup, and a Windows no-pooling fallback.
+- Added bounded output storage/resources, atomic task-state persistence, atomic remote file writes, optimistic SHA-256 writes, and local transfer-root enforcement.
+
 ## [2.0.0] - 2026-07-07
 
 ### Changed

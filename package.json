@@ -1,7 +1,7 @@
 {
   "name": "@hahalololos/mcp-ssh",
-  "version": "2.0.0",
-  "description": "MCP Agent for managing SSH hosts - A Model Context Protocol server for SSH operations",
+  "version": "3.0.0",
+  "description": "Final-target-first OpenSSH runtime for Model Context Protocol",
   "main": "server.mjs",
   "bin": {
     "mcp-ssh": "bin/mcp-ssh.js"
@@ -15,7 +15,10 @@
     "dev": "node bin/mcp-ssh.js",
     "build": "echo \"Build skipped\"",
     "build:dxt": "bash scripts/build-dxt.sh",
-    "test": "vitest run --coverage",
+    "test": "vitest run --coverage src/v3.test.mjs src/v3.contract.test.mjs",
+    "test:unit": "vitest run src/v3.test.mjs src/v3.contract.test.mjs",
+    "test:integration": "vitest run test-ssh/v3.integration.test.mjs",
+    "test:contract": "vitest run src/v3.contract.test.mjs",
     "test:watch": "vitest",
     "prepublishOnly": "npm run test",
     "version": "git add -A",
@@ -46,8 +49,7 @@
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.12.0",
-    "glob": "^11.0.3",
-    "ssh-config": "^5.0.0"
+    "glob": "^11.0.3"
   },
   "optionalDependencies": {
     "keytar": "^7.9.0"

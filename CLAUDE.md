@@ -1,142 +1,30 @@
-# CLAUDE.md
+# mcp-ssh v3 开发说明
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+## 常用命令
 
-## Project Overview
+- `npm start`：通过 stdio 启动 MCP 服务。
+- `npm test`：运行 v3 单元与契约测试。
+- `npm run test:unit`、`npm run test:contract`、`npm run test:integration`：分别执行对应测试层。
+- `npm run build:dxt`：生成 DXT 包。
 
-This is MCP SSH Agent (@hahalololos/mcp-ssh) - a Model Context Protocol (MCP) server that provides SSH operations for AI assistants like Claude Desktop. The project uses native SSH commands (`ssh`, `scp`) rather than JavaScript SSH libraries for maximum reliability and compatibility.
+## 架构
 
-## Development Commands
+运行时从 `src/mcp/server.mjs` 进入，公开接口固定为五个工具：`ssh_targets`、`ssh_exec`、`ssh_file`、`ssh_transfer`、`ssh_task`。
 
-### Basic Operations
-- `npm start` - Start the MCP server (same as `npm run dev`)
-- `npm run dev` - Start the MCP server with debug output
-- `npm run build` - Currently a no-op (echo "Build skipped")
-- `npm test` - Run the vitest suite (`server.test.mjs`) with coverage
-- `npm run test:watch` - Vitest in watch mode
+- `TargetCatalog` 只发现 SSH 配置及 Include 中的显式别名；有效配置必须由 `ssh -G` 获取。
+- `RouteResolver` 解析 ProxyJump，并检测环路与超深路由。
+- `ConnectionManager` 按最终目标与配置指纹管理 POSIX ControlMaster；Windows 自动使用无复用实现。
+- 仅 `OpenSshAdapter` 可启动本地 `ssh` 与 `scp` 进程。
+- 执行、文件、传输和任务服务没有跨请求的 cwd 或环境变量状态。
 
-### Development Scripts
-- `./start.sh` - Start the server with debug output
-- `./start-silent.sh` - Start the server in silent mode (no debug output)
-- `node server.mjs` - Direct server execution
+## 安全不变量
 
-### Publishing
-- `npm version patch|minor|major` - Bump version and create git tag
-- `npm publish` - Publish to npm (see PUBLISHING.md for details)
-- `npm pack` - Create tarball for testing
+- 本地进程始终使用 argv 与 `shell: false`；不得接受模型提供的 SSH 选项、ProxyCommand 或 ControlPath。
+- `target` 必须是显式 SSH 配置别名，不能使用裸 `known_hosts` 地址。
+- 密码仅通过 keychain 或 `@password` 注释进入 askpass 环境；不得写入 argv、日志、错误或 MCP 返回。
+- `ssh_transfer` 的本地路径必须位于 `allowedLocalRoots`。
+- 危险命令只接受 MCP elicitation 的真实用户批准；工具参数中不存在 `confirmed` 绕过项。
 
-### DXT Package Building
-- `npm run build:dxt` - Build Desktop Extension (.dxt) package
-- `./scripts/build-dxt.sh` - Direct build script execution
+## 状态目录
 
-## Architecture
-
-### Main Entry Point
-- `server.mjs` - Self-contained MCP server implementation that includes all functionality inline to avoid module resolution issues
-
-### Other Files
-- `bin/mcp-ssh.js` - Binary wrapper for npx compatibility
-
-### Key Design Decisions
-1. **Native SSH Tools**: Uses system `ssh` and `scp` commands rather than JavaScript SSH libraries for reliability
-2. **Self-contained**: `server.mjs` includes all code inline to avoid ESM import issues
-3. **Silent Mode**: Controlled by `MCP_SILENT` environment variable to disable debug output when used as MCP server
-4. **No shell on spawn**: All `spawn`/`execFile` calls use `shell: false`. On Windows, `ssh.exe`/`scp.exe` are resolved to absolute paths once at startup via `resolveExecutable()` (PATH + PATHEXT walk), so PATH lookup does not require `shell: true`. This is required to prevent local command injection through shell metacharacters in tool arguments.
-5. **Strict `hostAlias` whitelist**: `_assertSafeHostAlias()` (`SSHClient`) rejects any `hostAlias` that does not match `^[A-Za-z0-9_.@:][A-Za-z0-9._@:-]*$`. Combined with the `--` argument terminator on every `ssh`/`scp` invocation, this blocks SSH option injection (e.g. `-oProxyCommand=…`) and shell-metacharacter injection. Validation is applied at the public SSH/SCP entry points and transitively covers the 6 MCP tools. **Do not weaken or bypass this validator** without understanding the security implications — see CHANGELOG entry for 1.3.5.
-
-## SSH Configuration Integration
-
-The agent automatically discovers SSH hosts from:
-- `~/.ssh/config` - Primary source for host configurations
-- `~/.ssh/known_hosts` - Additional hosts not in config
-
-Host discovery prioritizes SSH config entries first, then adds additional hosts from known_hosts.
-
-### Password Authentication
-
-Passwords can be stored as comment annotations in `~/.ssh/config`:
-```
-Host myrouter
-    HostName 192.168.1.1
-    User admin
-    # @password:secretPassword
-```
-
-- The `# @password:` annotation is read locally — the password **never** reaches the LLM or cloud provider
-- Works for login passwords and SSH key passphrases
-- Passwords are stripped from all tool outputs (only `passwordAuth: true` is exposed)
-- The server enforces `chmod 600` on config files containing `@password` annotations
-- Uses `SSH_ASKPASS` mechanism internally (temp script + env variable, no external dependencies)
-- The `user@host` format is supported for password lookup (strips user prefix to find the config entry)
-- Unknown host fingerprints are auto-accepted via `StrictHostKeyChecking=accept-new` (changed keys are still rejected)
-
-## MCP Tools Provided
-
-1. **ssh_hosts** - `list`, `info`, `check`, and `sessions` for host discovery and connection state
-2. **ssh_exec** - Run one command, a command batch, or parallel commands across hosts
-3. **ssh_file** - `read`, `write`, `edit`, and `append` remote file content
-4. **ssh_fs** - `list`, `stat`, `mkdir`, `rm`, and `mv` remote filesystem paths
-5. **ssh_transfer** - `upload` and `download` files or directories via SCP
-6. **ssh_task** - `start`, `status`, `stop`, and `list` long-running background tasks
-
-## Testing and Debugging
-
-### Manual Testing
-```bash
-# Test as MCP server
-npx @hahalololos/mcp-ssh
-
-# Test with debug output
-MCP_SILENT=false npx @hahalololos/mcp-ssh
-
-# Test installation
-npm pack
-npm install -g ./aiondadotcom-mcp-ssh-*.tgz
-mcp-ssh
-```
-
-### Integration Testing
-Configure in Claude Desktop's `claude_desktop_config.json`:
-```json
-{
-  "mcpServers": {
-    "mcp-ssh": {
-      "command": "npx",
-      "args": ["@hahalololos/mcp-ssh"]
-    }
-  }
-}
-```
-
-## Dependencies
-
-- `@modelcontextprotocol/sdk` - MCP protocol implementation
-- `ssh-config` - SSH configuration file parsing
-- Node.js built-ins: `child_process`, `fs/promises`, `os`, `path`
-
-## Desktop Extension Support
-
-The project supports Desktop Extensions (.dxt) for easy installation in Claude Desktop:
-
-- `manifest.json` - DXT package manifest with server configuration
-- `scripts/build-dxt.sh` - Build script that creates .dxt packages in `build/` directory
-- `.dxt` files are ZIP archives containing the manifest and server files
-- Built packages are excluded from git via `.gitignore` but can be uploaded to GitHub releases
-
-## Threat Model
-
-The LLM driving this MCP server is **not trusted** — its tool arguments can be steered by prompt injection from any untrusted text in the conversation context (web pages, e-mails, repo files, output of other MCP servers). When changing this codebase, keep these invariants:
-
-- **Local RCE must stay impossible.** `hostAlias`, `command`, `localPath` and `remotePath` must never reach a shell on the local machine. Use `spawn`/`execFile` with `shell: false` and an argv array. Never re-introduce `shell: true`.
-- **`runRemoteCommand` is by-design RCE on the configured remote.** That is the tool's contract; do not try to "sanitize" the `command` argument.
-- **`uploadFile`/`downloadFile` give the LLM the local filesystem with the server process's privileges.** The README documents this; users are expected to run mcp-ssh under an unprivileged user or in a sandbox. Path arguments are not sandboxed.
-- **`# @password:` values must never appear in MCP responses** or in any string the LLM can see. Only `passwordAuth: true` is exposed.
-- See README → "Threat Model and Trust Boundaries" for the user-facing version of this.
-
-## Important Notes
-
-- The project is ESM-only (`"type": "module"` in package.json). The `.mjs` extension on `server.mjs` is historical and redundant given `"type": "module"`; keep it for now to avoid touching `bin/`, `manifest.json`, `package.json` `main`, and the start scripts.
-- Production code is in `server.mjs`, not compiled from TypeScript
-- SSH operations require properly configured SSH keys or `@password` annotations
-- The agent runs over STDIO as an MCP server, not as a standalone application
-- DXT packages provide one-click installation alternative to manual JSON configuration
+默认目录为 `~/.mcp-ssh/`：ControlPath 在 `runtime/control`，大输出在 `runtime/outputs`，任务记录在 `state/tasks.json`。POSIX 目录与文件权限分别为 `0700` 和 `0600`。

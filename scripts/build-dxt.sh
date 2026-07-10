@@ -35,6 +35,7 @@ echo -e "${YELLOW}Preparing DXT staging directory...${NC}"
 
 cp package.json package-lock.json manifest.json server.mjs CHANGELOG.md LICENSE "$STAGE_DIR/"
 cp -R bin src "$STAGE_DIR/"
+cp -R docs "$STAGE_DIR/"
 find "$STAGE_DIR/src" -name "*.test.mjs" -delete
 
 echo -e "${YELLOW}Installing production dependencies...${NC}"
