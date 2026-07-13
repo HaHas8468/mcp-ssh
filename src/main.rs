@@ -655,19 +655,16 @@ fn sanitize(s: &str) -> String {
         .into()
 }
 fn markers(s: &str, id: &str) -> (String, bool, Option<i64>) {
-    let mut start = false;
-    let mut exit = None;
-    let mut out = Vec::new();
-    for l in s.lines() {
-        if l == format!("__MCP_SSH_STARTED_{id}") {
-            start = true
-        } else if let Some(n) = l.strip_prefix(&format!("__MCP_SSH_EXIT_{id}=")) {
-            exit = n.parse().ok()
-        } else {
-            out.push(l)
-        }
-    }
-    (out.join("\n"), start, exit)
+    let start_marker = format!("__MCP_SSH_STARTED_{id}");
+    let exit_re = Regex::new(&format!(r"__MCP_SSH_EXIT_{}=(-?\d+)", regex::escape(id))).unwrap();
+    let started = s.contains(&start_marker);
+    let exit = exit_re
+        .captures(s)
+        .and_then(|captures| captures.get(1))
+        .and_then(|value| value.as_str().parse().ok());
+    let without_start = s.replace(&start_marker, "");
+    let cleaned = exit_re.replace_all(&without_start, "");
+    (cleaned.trim_matches('\n').to_string(), started, exit)
 }
 
 fn schemas() -> Value {
@@ -879,6 +876,14 @@ mod tests {
         let (s, started, exit) =
             markers("__MCP_SSH_STARTED_abc\nhello\n__MCP_SSH_EXIT_abc=0\n", id);
         assert_eq!(s, "hello");
+        assert!(started);
+        assert_eq!(exit, Some(0));
+    }
+    #[test]
+    fn markers_are_removed_without_a_trailing_newline() {
+        let (output, started, exit) =
+            markers("__MCP_SSH_STARTED_abc\nhello__MCP_SSH_EXIT_abc=0\n", "abc");
+        assert_eq!(output, "hello");
         assert!(started);
         assert_eq!(exit, Some(0));
     }
